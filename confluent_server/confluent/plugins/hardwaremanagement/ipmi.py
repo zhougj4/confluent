@@ -733,7 +733,9 @@ class IpmiHandler(object):
                     self.node, ipv4addr=lancfg['ipv4_address'],
                     ipv4gateway=lancfg['ipv4_gateway'],
                     ipv4cfgmethod=lancfg['ipv4_configuration'],
-                    hwaddr=lancfg['mac_address']
+                    hwaddr=lancfg['mac_address'],
+                    ipv6_addr = lancfg['ipv6_addresses']
+
                 ))
             elif self.op == 'update':
                 config = self.inputdata.netconfig(self.node)
