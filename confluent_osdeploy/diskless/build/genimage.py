@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 import ctypes
 import ctypes.util
 import glob
@@ -135,6 +135,8 @@ def main():
         build_root(opts, args[1:])
     if args[0] == 'exec':
         exec_root(opts, args[1:])
+    if args[0] == 'pack':
+        pack_image(opts, args[1:])
 
 
 def exec_root(opts, args):
@@ -145,6 +147,8 @@ def exec_root_backend(optargs):
     installroot = args[0]
     imgname = os.path.basename(installroot)
     _mount_constrained_fs(opts, installroot)
+    _mount('/etc/resolv.conf', os.path.join(installroot, 'etc/resolv.conf'), flags=MS_BIND|MS_RDONLY)
+    _mount('none', os.path.join(installroot, 'etc/resolv.conf'), flags=MS_RDONLY|MS_REMOUNT|MS_BIND)
     os.chroot(installroot)
     os.chdir('/')
     os.environ['PS1'] = '[\x1b[1m\x1b[4mIMGUTIL EXEC {0}\x1b[0m \W]$ '.format(imgname)
@@ -169,6 +173,7 @@ def build_root_backend(optargs):
     installroot = args[0]
     _mount_constrained_fs(opts, installroot)
     subprocess.check_call(yumargs)
+    open(os.path.join(installroot, 'etc/resolv.conf'),'w').close()
     mydir = os.path.dirname(__file__)
     dracutdir = os.path.join(mydir, 'dracut')
     targdir = os.path.join(installroot, 'usr/lib/dracut/modules.d/97diskless')
@@ -243,6 +248,12 @@ def pack_image(opts, args):
     initrdname = os.path.join(args[0], 'boot/initramfs-diskless-{0}.img'.format(mostrecent))
     mkdirp(os.path.join(outdir, 'boot/efi/boot'))
     mkdirp(os.path.join(outdir, 'boot/initramfs'))
+    os.symlink(
+        '/var/lib/confluent/public/site/initramfs.cpio',
+        os.path.join(outdir, 'boot/initramfs/site.cpio'))
+    #os.symlink(
+    #    '/var/lib/confluent/public/site/initramfs.cpio',
+    #    os.path.join(outdir, 'boot/initramfs/site.cpio'))
     shutil.copyfile(kvermap[mostrecent], os.path.join(outdir, 'boot/kernel'))
     shutil.copyfile(initrdname, os.path.join(outdir, 'boot/initramfs/distribution'))
     shutil.copyfile(os.path.join(args[0], 'boot/efi/EFI/BOOT/BOOTX64.EFI'), os.path.join(outdir, 'boot/efi/boot/BOOTX64.EFI'))
