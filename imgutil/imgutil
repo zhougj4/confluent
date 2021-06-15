@@ -1,0 +1,387 @@
+#!/usr/bin/python3
+import configparser
+import ctypes
+import ctypes.util
+import glob
+import optparse
+import os
+import pwd
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+libc = ctypes.CDLL(ctypes.util.find_library('c'))
+CLONE_NEWNS = 0x00020000
+CLONE_NEWCGROUP = 0x02000000
+CLONE_NEWUTS = 0x04000000
+CLONE_NEWIPC = 0x08000000
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWPID = 0x20000000
+PR_SET_NO_NEW_PRIVS = 38
+PR_SET_DUMPABLE = 4
+MS_RDONLY = 1
+MS_REMOUNT = 32
+MS_BIND = 4096
+MS_REC = 16384
+MS_PRIVATE = 1<<18
+
+
+numregex = re.compile('([0-9]+)')
+
+def create_yumconf(sourcedir):
+    repodir = tempfile.mkdtemp(prefix='genimage-yumrepos.d-')
+    yumconf = open(os.path.join(repodir, 'repos.repo'), 'w+')
+    if '/' not in sourcedir:
+        sourcedir = os.path.join('/var/lib/confluent/distributions', sourcedir)
+    if os.path.exists(sourcedir + '/repodata'):
+        pass
+    else:
+        c = configparser.ConfigParser()
+        c.read(sourcedir + '/.treeinfo')
+        for sec in c.sections():
+            if sec.startswith('variant-'):
+                try:
+                    repopath = c.get(sec, 'repository')
+                except Exception:
+                    continue
+                _, varname = sec.split('-', 1)
+                yumconf.write('[genimage-{0}]\n'.format(varname.lower()))
+                yumconf.write('name=Local install repository for {0}\n'.format(varname))
+                currdir = os.path.join(sourcedir, repopath)
+                yumconf.write('baseurl={0}\n'.format(currdir))
+                yumconf.write('enabled=1\ngpgcheck=0\n\n')
+    return repodir
+
+def get_mydir(oscategory):
+    mydir = os.path.dirname(__file__)
+    mycopy = os.path.join(mydir, oscategory)
+    gencopy = os.path.join('/opt/confluent/lib/imgutil', oscategory)
+    if os.path.exists(mycopy):
+        return mycopy
+    return gencopy
+
+class ElHandler(object):
+    def __init__(self, name, version, arch):
+        self.name = name
+        self.version = version
+        self.arch = arch
+        self.sourcepath = None
+        self.osname = '{}-{}-{}'.format(name, version, arch)
+        self.oscategory = 'el8'
+        self.yumargs = []
+
+    def add_pkglists(self):
+        with open(os.path.join(get_mydir('el8'), 'pkglist'), 'r') as pkglist:
+            pkgs = pkglist.read()
+            pkgs = pkgs.split()
+            self.yumargs.extend(pkgs)
+
+    def set_source(self, sourcepath):
+        yumconfig = create_yumconf(sourcepath)
+        self.yumargs.extend(
+            ['--setopt=reposdir={0}'.format(yumconfig), '--disablerepo=*',
+             '--enablerepo=genimage-*'])
+        self.sourcepath = sourcepath
+
+    def set_target(self, targpath):
+        self.targpath = targpath
+        self.yumargs.extend(
+            ['--installroot={0}'.format(targpath),
+             '--releasever={0}'.format(self.version), 'install'])
+
+    def prep_root(self):
+        mkdirp(os.path.join(self.targpath, 'usr/lib/dracut/modules.d'))
+        mkdirp(os.path.join(self.targpath, 'etc/dracut.conf.d'))
+        open(os.path.join(self.targpath, 'etc/resolv.conf'),'w').close()
+        mydir = get_mydir('el8')
+        dracutdir = os.path.join(mydir, 'dracut')
+        targdir = os.path.join(self.targpath, 'usr/lib/dracut/modules.d/97diskless')
+        shutil.copytree(dracutdir, targdir)
+        with open(os.path.join(self.targpath, 'etc/dracut.conf.d/diskless.conf'), 'w') as dracutconf:
+            dracutconf.write('compress=xz\nhostonly=no\ndracutmodules+="diskless base terminfo"\n')
+        cmd = ['chmod', 'a+x']
+        cmd.extend(glob.glob(os.path.join(targdir, '*')))
+        subprocess.check_call(cmd)
+        subprocess.check_call(['yum'] + self.yumargs)
+
+
+def naturalize_string(key):
+    """Analyzes string in a human way to enable natural sort
+
+    :param nodename: The node name to analyze
+    :returns: A structure that can be consumed by 'sorted'
+    """
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(numregex, key)]
+
+def natural_sort(iterable):
+    """Return a sort using natural sort if possible
+
+    :param iterable:
+    :return:
+    """
+    try:
+        return sorted(iterable, key=naturalize_string)
+    except TypeError:
+        # The natural sort attempt failed, fallback to ascii sort
+        return sorted(iterable)
+
+
+def get_kern_version(filename):
+    with open(filename, 'rb') as kernfile:
+        kernfile.seek(0x20e)
+        offset = struct.unpack('<H', kernfile.read(2))[0] + 0x200
+        kernfile.seek(offset)
+        verinfo = kernfile.read(128)
+        version, _ = verinfo.split(b' ', 1)
+        if not isinstance(version, str):
+            version = version.decode('utf8')
+        return version
+
+
+def mkdirp(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != 17:
+            raise
+
+
+def run_constrained(function, args):
+    # first fork to avoid changing namespace of unconstrained environment
+    pid = os.fork()
+    if pid:
+        os.waitpid(pid, 0)
+        return
+    libc.unshare(CLONE_NEWNS|CLONE_NEWPID)
+    # must fork again due to CLONE_NEWPID, or else lose the ability to make
+    # subprocesses
+    pid = os.fork()
+    if pid:
+        os.waitpid(pid, 0)
+        os._exit(0)
+        return
+    # we are pid 1 now
+    _mount('none', '/', flags=MS_REC|MS_PRIVATE)
+    _mount('proc', '/proc', fstype='proc')
+    function(args)
+    os._exit(0)
+
+
+def main():
+    parser = optparse.OptionParser()
+    parser.add_option('-s', '--source', help='Directory to pull installation '
+        'from (e.g. /var/lib/confluent/distributions/rocky-8.3-x86_64')
+    parser.add_option(
+        '-v', '--volume',
+        help='Directory to make available in install environment.  -v / will '
+        'cause it to be mounted in image as /run/external/, -v /:/run/root '
+        'will override the target to be /run/root', action='append')
+    (opts, args) = parser.parse_args()
+    if args[0] == 'build':
+        build_root(opts, args[1:])
+    if args[0] == 'exec':
+        exec_root(opts, args[1:])
+    if args[0] == 'pack':
+        pack_image(opts, args[1:])
+
+
+def exec_root(opts, args):
+    run_constrained(exec_root_backend, (opts, args))
+
+def exec_root_backend(optargs):
+    opts, args = optargs
+    installroot = args[0]
+    imgname = os.path.basename(installroot)
+    _mount_constrained_fs(opts, installroot)
+    _mount('/etc/resolv.conf', os.path.join(installroot, 'etc/resolv.conf'), flags=MS_BIND|MS_RDONLY)
+    _mount('none', os.path.join(installroot, 'etc/resolv.conf'), flags=MS_RDONLY|MS_REMOUNT|MS_BIND)
+    os.chroot(installroot)
+    os.chdir('/')
+    os.environ['PS1'] = '[\x1b[1m\x1b[4mIMGUTIL EXEC {0}\x1b[0m \W]$ '.format(imgname)
+    os.execv('/bin/bash', ['/bin/bash', '--login', '--noprofile'])
+
+
+def _mount(src, dst, fstype=0, flags=0, options=0, mode=None):
+    if not isinstance(src, bytes):
+        src = src.encode('utf8')
+    if fstype and not isinstance(fstype, bytes):
+        fstype = fstype.encode('utf8')
+    if not isinstance(dst, bytes):
+        dst = dst.encode('utf8')
+    res = libc.mount(src, dst, fstype, flags, options)
+    if res:
+        raise Exception('Unable to mount {0} on {1}'.format(src, dst))
+    if mode is not None:
+        os.chmod(dst, mode)
+
+
+def build_root_backend(optargs):
+    opts, args, oshandler = optargs
+    installroot = args[0]
+    _mount_constrained_fs(opts, installroot)
+    oshandler.prep_root()
+
+
+def _mount_constrained_fs(opts, installroot):
+    _mount('/dev', os.path.join(installroot, 'dev'), flags=MS_BIND|MS_RDONLY)
+    _mount('proc', os.path.join(installroot, 'proc'), fstype='proc')
+    _mount('sys', os.path.join(installroot, 'sys'), fstype='sysfs')
+    _mount('runfs', os.path.join(installroot, 'run'), fstype='tmpfs')
+    if opts.volume is None:
+        opts.volume = []
+    for v in opts.volume:
+        if ':' in v:
+            src, dst = v.split(':')
+            dst = os.path.join(installroot, dst)
+        else:
+            src = v
+            dst = os.path.join(installroot, 'run/external')
+            dst = os.path.join(dst, v)
+        mkdirp(dst)
+        _mount(src, dst, flags=MS_BIND|MS_RDONLY)
+
+def check_root(installroot):
+    # Ensure that the target is an adequate filesystem to
+    # be root
+    mkdirp(installroot)
+    testpath = os.path.join(installroot, '.testcap')
+    with open(testpath, 'w') as tp:
+        tp.write('')
+    try:
+        subprocess.check_call(['setcap', 'cap_net_raw+p', testpath])
+    finally:
+        os.remove(testpath)
+
+
+def fingerprint_source_el(files, sourcepath):
+    for filen in files:
+        if '-release-8' in filen:
+            parts = filen.split('-')
+            osname = '_'.join(parts[:-3])
+            if osname == 'centos_linux':
+                osname = 'centos'
+            ver = parts[-2]
+            arch = parts[-1].split('.')[-2]
+            if arch == 'noarch':
+                prodinfo = open(os.path.join(sourcepath, '.discinfo')).read()
+                arch = prodinfo.split('\n')[2]
+            return ElHandler(osname, ver, arch)
+    return None
+
+
+def fingerprint_source(sourcepath):
+    oshandler = None
+    funs = [fingerprint_source_el]
+    for _, _, files in os.walk(sourcepath):
+        for ffun in funs:
+            oshandler = ffun(files, sourcepath)
+            if oshandler is not None:
+                return oshandler
+    return oshandler
+
+def fingerprint_host_el(hostpath='/'):
+    try:
+        import rpm
+    except ImportError:
+        return None
+    ts = rpm.TransactionSet(hostpath)
+    rpms = ts.dbMatch('provides', 'system-release')
+    for inf in rpms:
+        if 'el8' not in inf.release:
+            continue
+        osname = inf.name.replace('-release', '').replace('-', '_')
+        if osname == 'centos_linux':
+            osname = 'centos'
+        return ElHandler(osname, inf.version, os.uname().machine)
+
+
+def fingerprint_host(hostpath='/'):
+    oshandler = None
+    for fun in [fingerprint_host_el]:
+        oshandler = fun()
+        if oshandler is not None:
+            return oshandler
+    return oshandler
+
+def build_root(opts, args):
+    check_root(args[0])
+    yumargs = ['yum', '--installroot={0}'.format(args[0])]
+    if opts.source:
+        oshandler = fingerprint_source(opts.source)
+        if oshandler is not None:
+            oshandler.set_source(opts.source)
+    else:
+        oshandler = fingerprint_host()
+    if oshandler is None:
+        sys.stderr.write(
+            'Unable to recognize source directory {0}\n'.format(
+                opts.source))
+        sys.exit(1)
+    oshandler.set_target(args[0])
+    oshandler.add_pkglists()
+    for dirname in ('proc', 'sys', 'dev', 'run'):
+        mkdirp(os.path.join(args[0], dirname))
+    run_constrained(build_root_backend, (opts, args, oshandler))
+    if len(args) > 1:
+        pack_image(opts, args)
+
+
+def pack_image(opts, args):
+    outdir = args[1]
+    kerns = glob.glob(os.path.join(args[0], 'boot/vmlinuz-*'))
+    kvermap = {}
+    for kern in kerns:
+        if 'rescue' in kern:
+            continue
+        kvermap[get_kern_version(kern)] = kern
+    mostrecent = list(natural_sort(kvermap))[-1]
+    initrdname = os.path.join(args[0], 'boot/initramfs-{0}.img'.format(mostrecent))
+    mkdirp(os.path.join(outdir, 'boot/efi/boot'))
+    mkdirp(os.path.join(outdir, 'boot/initramfs'))
+    os.symlink(
+        '/var/lib/confluent/public/site/initramfs.cpio',
+        os.path.join(outdir, 'boot/initramfs/site.cpio'))
+    shutil.copyfile(kvermap[mostrecent], os.path.join(outdir, 'boot/kernel'))
+    shutil.copyfile(initrdname, os.path.join(outdir, 'boot/initramfs/distribution'))
+    shutil.copyfile(os.path.join(args[0], 'boot/efi/EFI/BOOT/BOOTX64.EFI'), os.path.join(outdir, 'boot/efi/boot/BOOTX64.EFI'))
+    grubbin = None
+    for candidate in glob.glob(os.path.join(args[0], 'boot/efi/EFI/*')):
+        if 'BOOT' not in candidate:
+            grubbin = os.path.join(candidate, 'grubx64.efi')
+            break
+    shutil.copyfile(grubbin, os.path.join(outdir, 'boot/efi/boot/grubx64.efi'))
+    subprocess.check_call(['mksquashfs', args[0],
+                           os.path.join(outdir, 'rootimg.sfs'), '-comp', 'xz'])
+    oshandler = fingerprint_host(args[0])
+    if oshandler:
+        prettyname = oshandler.osname
+        with open(os.path.join(args[0], 'etc/os-release')) as osr:
+            osrdata = osr.read().split('\n')
+            for line in osrdata:
+                if line.startswith('PRETTY_NAME="'):
+                    prettyname = line.replace(
+                        'PRETTY_NAME=', '').replace('"', '')
+        label = '{0} ({1}'.format(prettyname, 'Diskless Boot')
+        with open(os.path.join(outdir, 'profile.yaml'), 'w') as profile:
+            profile.write('label: {0}\nkernelargs: quiet # confluent_imagemethod=untethered|tethered\n'.format(label))
+        oscat = oshandler.oscategory
+        confdir = '/opt/confluent/lib/osdeploy/{}-diskless'.format(oscat)
+        os.symlink('{}/initramfs/addons.cpio'.format(confdir),
+            os.path.join(outdir, 'boot/initramfs/addons.cpio'))
+        if os.path.exists('{}/profiles/default'.format(confdir)):
+            shutil.copytree('{}/profiles/default', outdir)
+    try:
+        pwd.getpwnam('confluent')
+        subprocess.check_call(['chown', '-R', 'confluent', outdir])
+    except KeyError:
+        pass
+
+
+
+
+if __name__ == '__main__':
+    main()
