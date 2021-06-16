@@ -1,8 +1,8 @@
 . /lib/dracut-lib.sh
 mkdir -p /mnt/remoteimg /mnt/remote /mnt/overlay
-if [ "unethered" = $(getarg confluent_imagemethod) ]; then
+if [ "untethered" = "$(getarg confluent_imagemethod)" ]; then
     mount -t tmpfs untethered /mnt/remoteimg
-    curl https://$confluent_mgr/confluent-public/os/$confluent_profile/rootimg.sfs -O /mnt/remoteimg/rootimg.sfs
+    curl https://$confluent_mgr/confluent-public/os/$confluent_profile/rootimg.sfs -o /mnt/remoteimg/rootimg.sfs
 else
     confluent_urls="$confluent_urls https://$confluent_mgr/confluent-public/os/$confluent_profile/rootimg.sfs"
     /opt/confluent/bin/urlmount $confluent_urls /mnt/remoteimg
@@ -13,8 +13,8 @@ modprobe zram
 memtot=$(grep ^MemTotal: /proc/meminfo|awk '{print $2}')
 memtot=$((memtot/2))$(grep ^MemTotal: /proc/meminfo | awk '{print $3'})
 echo $memtot > /sys/block/zram0/disksize
-mkfs.xfs /dev/zram0
-mount /dev/zram0 /mnt/overlay
+mkfs.xfs /dev/zram0 > /dev/null
+mount -o discard /dev/zram0 /mnt/overlay
 mkdir -p /mnt/overlay/upper /mnt/overlay/work
 mount -t overlay -o upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work,lowerdir=/mnt/remote disklessroot /sysroot
 mkdir -p /sysroot/etc/ssh
@@ -79,5 +79,5 @@ mkdir -p /sysroot/opt/confluent/bin
 curl -sf https://$confluent_mgr/confluent-public/os/$confluent_profile/scripts/onboot.sh > /sysroot/opt/confluent/bin/onboot.sh
 chmod +x /sysroot/opt/confluent/bin/onboot.sh
 ln -s /etc/systemd/system/onboot.service /sysroot/etc/systemd/system/multi-user.target.wants/onboot.service
-cp /etc/confluennt/functions /sysroot/etc/confluent/functions
+cp /etc/confluent/functions /sysroot/etc/confluent/functions
 exec /opt/confluent/bin/start_root
