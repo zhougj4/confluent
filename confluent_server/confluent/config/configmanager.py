@@ -2282,10 +2282,7 @@ class ConfigManager(object):
                 else:
                     newdict = attribmap[node][attrname]
                 if 'value' in newdict and attrname.startswith("secret."):
-                    credv = newdict['value']
-                    if isinstance(credv, unicode):
-                        credv = credv.encode('ascii')
-                    newdict['cryptvalue'] = crypt_value(credv)
+                    newdict['cryptvalue'] = crypt_value(newdict['value'])
                     del newdict['value']
                 if 'value' in newdict and attrname.startswith("crypted."):
                     newdict['hashvalue'] = hashcrypt_value(newdict['value'])

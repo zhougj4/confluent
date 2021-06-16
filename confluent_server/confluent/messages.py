@@ -1049,10 +1049,14 @@ class InputNetworkConfiguration(ConfluentInputMessage):
         if not inputdata:
             raise exc.InvalidArgumentException('missing input data')
 
-        for field in inputdata:
-            if field.lower() not in ('ipv4_address', 'ipv4_gateway',
-                'ipv4_configuration'):
-                raise exc.InvalidArgumentException(field + ' is a read only field')
+        if 'hw_addr' in inputdata:
+            raise exc.InvalidArgumentException('hw_addr is a read only field')
+
+        if 'ipv4_address' not in inputdata:
+            inputdata['ipv4_address'] = None
+
+        if 'ipv4_gateway' not in inputdata:
+            inputdata['ipv4_gateway'] = None
 
         if 'ipv4_configuration' in inputdata and inputdata['ipv4_configuration']:
             if inputdata['ipv4_configuration'].lower() not in ['dhcp','static']:
@@ -1641,7 +1645,7 @@ class NetworkConfiguration(ConfluentMessage):
     desc = 'Network configuration'
 
     def __init__(self, name=None, ipv4addr=None, ipv4gateway=None,
-                 ipv4cfgmethod=None, hwaddr=None, **oemparams):
+                 ipv4cfgmethod=None, hwaddr=None):
         self.myargs = (name, ipv4addr, ipv4gateway, ipv4cfgmethod, hwaddr)
         self.notnode = name is None
         self.stripped = False
@@ -1650,12 +1654,8 @@ class NetworkConfiguration(ConfluentMessage):
             'ipv4_address': {'value': ipv4addr},
             'ipv4_gateway': {'value': ipv4gateway},
             'ipv4_configuration': {'value': ipv4cfgmethod},
-            'hw_addr': {'value': hwaddr}
+            'hw_addr': {'value': hwaddr},
         }
-        for k in oemparams:
-            oemparams[k] = {'value': oemparams[k]}
-        kvpairs.update(oemparams)
-
         if self.notnode:
             self.kvpairs = kvpairs
         else:
