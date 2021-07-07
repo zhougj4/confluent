@@ -2,7 +2,7 @@ get_remote_apikey() {
     while [ -z "$confluent_apikey" ]; do
         /opt/confluent/bin/clortho $nodename $confluent_mgr > /etc/confluent/confluent.apikey
         if grep ^SEALED: /etc/confluent/confluent.apikey > /dev/null; then
-            # we don't support remote sealed api keys anymore
+            # we don't support remote sealed api keys
             echo > /etc/confluent/confluent.apikey
         fi
         confluent_apikey=$(cat /etc/confluent/confluent.apikey)
@@ -30,6 +30,7 @@ netroot=confluent
 clear
 mkdir -p /etc/ssh
 mkdir -p /var/tmp/
+mkdir -p /var/lib/empty
 mkdir -p /var/empty/sshd
 mkdir -p /etc/confluent
 sed -i '/^root:x/d' /etc/passwd
@@ -64,8 +65,8 @@ mkdir /.ssh
 cat /ssh/*pubkey > /root/.ssh/authorized_keys 2>/dev/null
 cp /root/.ssh/authorized_keys /.ssh/
 cat /tls/*.pem > /etc/confluent/ca.pem
-mkdir -p /etc/pki/tls/certs
-cat /tls/*.pem > /etc/pki/tls/certs/ca-bundle.crt
+mkdir -p /var/lib/ca-certificates/
+cat /tls/*.pem > /var/lib/ca-certificates/ca-bundle.pem
 TRIES=0
 oldumask=$(umask)
 umask 0077
@@ -152,62 +153,14 @@ else
     if [ ! -z "$v4gw" ]; then
         ip route add default via $v4gw
     fi
-    mkdir -p /run/NetworkManager/system-connections
-    cat > /run/NetworkManager/system-connections/$ifname.nmconnection << EOC
-[connection]
-EOC
-    echo id=${ifname} >> /run/NetworkManager/system-connections/$ifname.nmconnection
-    echo uuid=$(uuidgen) >> /run/NetworkManager/system-connections/$ifname.nmconnection
-    cat >> /run/NetworkManager/system-connections/$ifname.nmconnection << EOC
-type=ethernet
-autoconnect-retries=1
-EOC
-    echo interface-name=$ifname >> /run/NetworkManager/system-connections/$ifname.nmconnection
-    cat >> /run/NetworkManager/system-connections/$ifname.nmconnection << EOC
-multi-connect=1
-permissions=
-wait-device-timeout=60000
-
-[ethernet]
-mac-address-blacklist=
-
-[ipv4]
-EOC
-    echo address1=$v4addr/$v4nm >> /run/NetworkManager/system-connections/$ifname.nmconnection
+    mkdir -p /run/confluent
+    echo -e "BOOTPROTO='static'\nSTARTMODE='auto'" >> /run/confluent/ifcfg-$ifname
+    echo "IPADDR='$v4addr/$v4nm'" >> /run/confluent/ifcfg-$ifname
     if [ ! -z "$v4gw" ]; then
-        echo gateway=$v4gw >> /run/NetworkManager/system-connections/$ifname.nmconnection
+        echo defafult $v4gw - $ifname > /run/confluent/ifroute-$ifname
     fi
-    nameserversec=0
-    nameservers=""
-    while read -r entry; do
-        if [ $nameserversec = 1 ]; then
-            if [[ $entry == "-"* ]]; then
-                nameservers="$nameservers"${entry#- }";"
-                continue
-            fi
-        fi
-        nameserversec=0
-        if [ "${entry%:*}" = "nameservers" ]; then
-            nameserversec=1
-            continue
-        fi
-    done < /etc/confluent/confluent.deploycfg
-    echo dns=$nameservers >> /run/NetworkManager/system-connections/$ifname.nmconnection
-    dnsdomain=$(grep ^dnsdomain: /etc/confluent/confluent.deploycfg)
-    dnsdomain=${dnsdomain#dnsdomain: }
-    echo dns-search=$dnsdomain >> /run/NetworkManager/system-connections/$ifname.nmconnection
-    cat >> /run/NetworkManager/system-connections/$ifname.nmconnection << EOC
-may-fail=false
-method=manual
-
-[ipv6]
-addr-gen-mode=eui64
-method=auto
-
-[proxy]
-EOC
 fi
-chmod 600 /run/NetworkManager/system-connections/*.nmconnection
+
 echo -n "Initializing ssh..."
 ssh-keygen -A
 for pubkey in /etc/ssh/ssh_host*key.pub; do

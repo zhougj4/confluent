@@ -71,14 +71,34 @@ echo '    EnableSSHKeysign yes' >> $sshconf
 echo '    HostbasedKeyTypes *ed25519*' >> $sshconf
 curl -sf -H "CONFLUENT_NODENAME: $nodename" -H "CONFLUENT_APIKEY: $(cat /etc/confluent/confluent.apikey)" https://$confluent_mgr/confluent-api/self/nodelist > /sysroot/etc/ssh/shosts.equiv
 cp /sysroot/etc/ssh/shosts.equiv /sysroot/root/.shosts
-chmod 640 /sysroot/etc/ssh/*_key
-chroot /sysroot chgrp ssh_keys /etc/ssh/*_key
-cp /tls/*.pem /sysroot/etc/pki/ca-trust/source/anchors/
-chroot /sysroot/ update-ca-trust
+chmod 600 /sysroot/etc/ssh/*_key
+chroot /sysroot cat /etc/confluent/ca.pem >> /sysroot/var/lib/ca-certificates/ca-bundle.pem
 curl -sf https://$confluent_mgr/confluent-public/os/$confluent_profile/scripts/onboot.service > /sysroot/etc/systemd/system/onboot.service
 mkdir -p /sysroot/opt/confluent/bin
 curl -sf https://$confluent_mgr/confluent-public/os/$confluent_profile/scripts/onboot.sh > /sysroot/opt/confluent/bin/onboot.sh
 chmod +x /sysroot/opt/confluent/bin/onboot.sh
 ln -s /etc/systemd/system/onboot.service /sysroot/etc/systemd/system/multi-user.target.wants/onboot.service
 cp /etc/confluent/functions /sysroot/etc/confluent/functions
+
+nameserversec=0
+nameservers=""
+while read -r entry; do
+    if [ $nameserversec = 1 ]; then
+        if [[ $entry == "-"* ]]; then
+            nameservers="$nameservers"${entry#- }" "
+            continue
+        fi
+    fi
+    nameserversec=0
+    if [ "${entry%:*}" = "nameservers" ]; then
+        nameserversec=1
+        continue
+    fi
+done < /etc/confluent/confluent.deploycfg
+nameservers=${nameservers% }
+sed -i 's/^NETCONFIG_DNS_STATIC_SERVERS="/NETCONFIG_DNS_STATIC_SERVERS="'"$nameservers"/ /sysroot/etc/sysconfig/network/config
+dnsdomain=$(grep ^dnsdomain: /etc/confluent/confluent.deploycfg)
+dnsdomain=${dnsdomain#dnsdomain: }
+sed -i 's/^NETCONFIG_DNS_STATIC_SEARCHLIST="/NETCONFIG_DNS_STATIC_SEARCHLIST="'$dnsdomain/ /sysroot/etc/sysconfig/network/config
+cp /run/confluent/ifroute-* /run/confluent/ifcfg-* /sysroot/etc/sysconfig/network
 exec /opt/confluent/bin/start_root
