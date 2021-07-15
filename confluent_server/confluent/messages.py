@@ -274,6 +274,15 @@ class ConfluentTargetTimeout(ConfluentNodeError):
     def strip_node(self, node):
         raise exc.TargetEndpointUnreachable(self.error)
 
+class ConfluentMountMediaError(ConfluentNodeError):
+    apicode = 500
+
+    def __init__(self, node, errstr):
+        self.node = node
+        self.error = errstr
+
+    def strip_node(self, node):
+        raise exc.InvalidArgumentException(self.error)
 
 class ConfluentTargetNotFound(ConfluentNodeError):
     apicode = 404
@@ -498,6 +507,9 @@ def get_input_message(path, operation, inputdata, nodes=None, multinode=False,
     elif (path[:4] == ['configuration', 'management_controller', 'ntp',
             'servers'] and operation != 'retrieve' and len(path) == 5):
         return InputNTPServer(path, nodes, inputdata)
+    elif (path[:4] == ['media', 'attach', 'tsm']
+          and operation != 'retrieve'):
+        return InputRisConfiguration(path, nodes, inputdata)
     elif (path[:3] in (['configuration', 'system', 'all'],
             ['configuration', 'management_controller', 'extended']) and
             operation != 'retrieve'):
@@ -1143,6 +1155,69 @@ class InputNTPEnabled(ConfluentInputMessage):
         return self.inputbynode[node]
 
 
+class InputRisConfiguration(ConfluentInputMessage):
+    def __init__(self, path, nodes, inputdata):
+        self.inputbynode = {}
+        self.stripped = False
+        if not inputdata:
+            raise exc.InvalidArgumentException('missing input data')
+
+        for key in ['ris_state', 'ip_address', 'source_path', 'share_type', 'user_name', 'password', 'domain_name']:
+            if key not in inputdata:
+                inputdata[key] = None
+
+        if inputdata['ris_state']:
+            allowed_ris_state_values = ['enable','disable']
+            if inputdata['ris_state'].lower() not in allowed_ris_state_values:
+                raise exc.InvalidArgumentException(
+                    'Unrecognized ris_state. Allowed values are: ' + str(allowed_ris_state_values))
+
+        if inputdata['share_type']:
+            allowed_share_types = ['nfs', '', None, 'cifs']
+            if inputdata['share_type'].lower() not in allowed_share_types:
+                raise exc.InvalidArgumentException(
+                    'Unrecognized share_type. Allowed values are: ' + str(allowed_share_types))
+
+        if nodes is None:
+            raise exc.InvalidArgumentException(
+                'This only supports per-node input')
+        for node in nodes:
+            self.inputbynode[node] = inputdata
+
+    def ris_configuration(self, node):
+        return self.inputbynode[node]
+
+class RisConfiguration(ConfluentMessage):
+    desc = 'Ris Configuration'
+
+    valid_states = set([
+        'enable',
+        'disable',
+    ])
+
+    def __init__(self, name=None, ris_state=None, source_path=None, ip_address=None,
+                 share_type=None, domain_name=None, user_name=None, password=None):
+        if ris_state not in self.valid_states :
+            raise Exception("Invalid ris_state argument passed in:" +
+                            repr(ris_state))
+
+        self.notnode = name is None
+        self.stripped = False
+
+        kvpairs = {
+            'ris_state': {'value': ris_state},
+            'ip_address': {'value': ip_address},
+            'source_path': {'value': source_path},
+            'share_type': {'value': share_type},
+            'domain_name': {'value': domain_name},
+            'user_name': {'value': user_name},
+            'password': {'value': password, 'type': 'password'},
+        }
+
+        if self.notnode:
+            self.kvpairs = kvpairs
+        else:
+            self.kvpairs = {name: kvpairs}
 class BootDevice(ConfluentChoiceMessage):
     valid_values = set([
         'network',

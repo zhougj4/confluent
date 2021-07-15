@@ -428,6 +428,17 @@ def perform_requests(operator, nodes, element, cfg, inputdata, realop):
 
 def perform_request(operator, node, element,
                     configdata, inputdata, cfg, results, realop):
+        mount_media_error_messages = [
+            'Error in get vmedia configuration',
+            'Error in retrieving available image information',
+            'Image file not found',
+            'Image format is not supported',
+            'invalid start/stop command',
+            'Media support is not enabled',
+            'Media is not running',
+            'Slot is not available for the particular Image type',
+            'Valid Image is not available',
+        ]
         try:
             return IpmiHandler(operator, node, element, configdata, inputdata,
                                cfg, results, realop).handle_request()
@@ -435,6 +446,9 @@ def perform_request(operator, node, element,
             excmsg = str(ipmiexc)
             if excmsg in ('Session no longer connected', 'timeout'):
                 results.put(msg.ConfluentTargetTimeout(node))
+            elif excmsg in mount_media_error_messages:
+                results.put(msg.ConfluentMountMediaError(node, excmsg))
+                raise
             else:
                 results.put(msg.ConfluentNodeError(node, excmsg))
                 raise
@@ -566,7 +580,7 @@ class IpmiHandler(object):
             self.handle_update()
         elif self.element[0] == 'inventory':
             self.handle_inventory()
-        elif self.element == ['media', 'attach']:
+        elif self.element[:2] == ['media', 'attach']:
             self.handle_attach_media()
         elif self.element == ['media', 'detach']:
             self.handle_detach_media()
@@ -618,6 +632,8 @@ class IpmiHandler(object):
             'nodes/{0}/support/servicedata/{1}'.format(self.node, u.name)))
 
     def handle_attach_media(self):
+        if self.element[-1] == 'tsm':
+            return self.handle_remote_images_configuration()
         try:
             self.ipmicmd.attach_remote_media(self.inputdata.nodefile(
                 self.node))
@@ -1300,6 +1316,62 @@ class IpmiHandler(object):
         else:
             raise exc.InvalidArgumentException('health is read-only')
 
+    def handle_remote_images_configuration(self):
+        if 'read' == self.op:
+            # Retrieving RIS configuration parameters for CD
+            # The parameters are suposed to be equal for every media type
+            ris_state_response = self.ipmicmd.get_ris_configuration_parameters(0x08)
+            response = self.ipmicmd.get_ris_configuration_parameters(0x01)
+            self.output.put(msg.RisConfiguration(
+                self.node,
+                ris_state=ris_state_response['ris_state'],
+                source_path=response['source_path'],
+                ip_address=response['ip_address'],
+                share_type=response['share_type'],
+                domain_name=response['domain_name'],
+                user_name=response['user_name'],
+                password=response['password'],
+            ))
+        elif 'update' == self.op:
+            # Disable Remote Images Service in order to clean up state
+            self.ipmicmd.set_ris_configuration_parameter(0x08, 0x0a, 'disable')
+
+            config = self.inputdata.ris_configuration(self.node)
+
+            if config['ris_state']:
+                self.ipmicmd.set_ris_configuration_parameter(0x08, 0x0a, config['ris_state'])
+                ris_state_should_enable = config['ris_state'] == 'enable'
+            for media_type_id in [0x01, 0x02, 0x04]:
+                if config['ip_address']:
+                    self.ipmicmd.set_ris_configuration_parameter(media_type_id, 0x02, config['ip_address'])
+                if config['source_path']:
+                    self.ipmicmd.set_ris_configuration_parameter(media_type_id, 0x01, config['source_path'])
+                if config['share_type']:
+                    self.ipmicmd.set_ris_configuration_parameter(media_type_id, 0x05, config['share_type'])
+                if config['user_name']:
+                    self.ipmicmd.set_ris_configuration_parameter(media_type_id, 0x03, config['user_name'])
+                if config['domain_name']:
+                    self.ipmicmd.set_ris_configuration_parameter(media_type_id, 0x06, config['domain_name'])
+                if config['password']:
+                    self.ipmicmd.set_ris_configuration_parameter(media_type_id, 0x04, config['password'])
+
+            # Restart RIS
+            self.ipmicmd.set_ris_configuration_parameter(0x08, 11, None)
+            # Enable RIS redirection (necessary to allow media redirection)
+            self.ipmicmd.set_ris_redirection_state(0x01, 'start')
+
+            ris_state_response = self.ipmicmd.get_ris_configuration_parameters(0x08)
+            response = self.ipmicmd.get_ris_configuration_parameters(0x01)
+            self.output.put(msg.RisConfiguration(
+                self.node,
+                ris_state=ris_state_response['ris_state'],
+                source_path=response['source_path'],
+                ip_address=response['ip_address'],
+                share_type=response['share_type'],
+                domain_name=response['domain_name'],
+                user_name=response['user_name'],
+                password=response['password'],
+            ))
     def reseat_bay(self):
         bay = self.inputdata.inputbynode[self.node]
         try:

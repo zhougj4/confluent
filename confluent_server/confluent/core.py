@@ -413,7 +413,7 @@ def _init_core():
                 'pluginattrs': ['hardwaremanagement.method'],
                 'default': 'ipmi',
             }),
-            'attach': PluginRoute({
+            'attach': PluginCollection({
                 'pluginattrs': ['hardwaremanagement.method'],
                 'default': 'ipmi',
             }),
