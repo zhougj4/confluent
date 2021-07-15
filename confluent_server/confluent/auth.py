@@ -26,6 +26,7 @@ import Cryptodome.Protocol.KDF as KDF
 from fnmatch import fnmatch
 import hashlib
 import hmac
+import msgpack
 import multiprocessing
 import os
 import pwd
@@ -99,6 +100,10 @@ _deniedbyrole = {
     }
 }
 
+
+class PromptsNeeded(Exception):
+    def __init__(self, prompts):
+        self.prompts = prompts
 
 def _get_usertenant(name, tenant=False):
     """_get_usertenant
@@ -221,11 +226,14 @@ def check_user_passphrase(name, passphrase, operation=None, element=None, tenant
     if ucfg is None:
         eventlet.sleep(0.05)
         return None
+    bpassphrase = None
+    if isinstance(passphrase, dict) and len(passphrase) == 1:
+        passphrase = list(passphrase.values())[0]
     if isinstance(passphrase, bytes):
         bpassphrase = passphrase
-    else:
+    elif not isinstance(passphrase, dict):
         bpassphrase = passphrase.encode('utf8')
-    if (user, tenant) in _passcache:
+    if (user, tenant) in _passcache and bpassphrase:
         if hashlib.sha256(bpassphrase).digest() == _passcache[(user, tenant)]:
             return authorize(user, element, tenant, operation=operation)
         else:
@@ -233,7 +241,7 @@ def check_user_passphrase(name, passphrase, operation=None, element=None, tenant
             # while someone is legitimately logged in
             # invalidate cache and force the slower check
             del _passcache[(user, tenant)]
-    if 'cryptpass' in ucfg:
+    if 'cryptpass' in ucfg and bpassphrase:
         _passchecking[(user, tenant)] = True
         # TODO(jbjohnso): WORKERPOOL
         # PBKDF2 is, by design, cpu intensive
@@ -275,23 +283,41 @@ def check_user_passphrase(name, passphrase, operation=None, element=None, tenant
             # to let a non-0 user check anothers password.
             # We will fork and the child will assume elevated privilege to
             # get unix_chkpwd helper to enable checking /etc/shadow
+            getprompt, sendprompt = os.pipe()
+            getprompt, sendprompt = os.fdopen(getprompt, 'rb', 0), os.fdopen(sendprompt, 'wb', 0)
             pid = os.fork()
             if not pid:
                 usergood = False
                 try:
+                    getprompt.close()
                     # we change to the uid we are trying to authenticate as, because
                     # pam_unix uses unix_chkpwd which reque
                     os.setuid(pwe.pw_uid)
-                    usergood = pam.authenticate(user, passphrase, service=_pamservice)
+                    pa = pam.pam()
+                    usergood = pa.authenticate(user, passphrase, service=_pamservice)
+                    if (not usergood and len(pa.prompts) > 1 and
+                            (not isinstance(passphrase, dict) or
+                            (set(passphrase) - pa.prompts))):
+                        sendprompt.write(msgpack.packb(list(pa.prompts)))
+                        sendprompt.close()
+                        os._exit(2)
                 finally:
                     os._exit(0 if usergood else 1)
-            usergood = os.waitpid(pid, 0)[1] == 0
+            sendprompt.close()
+            usergood = os.waitpid(pid, 0)[1]
+            if (usergood >> 8) == 2:
+                prompts = getprompt.read()
+                if (prompts):
+                    raise PromptsNeeded(msgpack.unpackb(prompts))
+            usergood = usergood == 0
+            getprompt.close()
         else:
             # We are running as root, we don't need to fork in order to authenticate the
             # user
             usergood = pam.authenticate(user, passphrase, service=_pamservice)
         if usergood:
-            _passcache[(user, tenant)] = hashlib.sha256(bpassphrase).digest()
+            if bpassphrase:
+                _passcache[(user, tenant)] = hashlib.sha256(bpassphrase).digest()
             return authorize(user, element, tenant, operation, skipuserobj=False)
     eventlet.sleep(0.05)  # stall even on test for existence of a username
     return None
