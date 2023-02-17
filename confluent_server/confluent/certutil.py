@@ -1,10 +1,18 @@
 import os
 import confluent.collective.manager as collective
+import confluent.util as util
 from os.path import exists
 import shutil
 import socket
 import eventlet.green.subprocess as subprocess
 import tempfile
+
+def mkdirp(targ):
+    try:
+        return os.makedirs(targ)
+    except OSError as e:
+        if e.errno != 17:
+            raise
 
 def get_openssl_conf_location():
     if exists('/etc/pki/tls/openssl.cnf'):
@@ -14,8 +22,17 @@ def get_openssl_conf_location():
     else:
         raise Exception("Cannot find openssl config file")
 
+def normalize_uid():
+    curruid = os.geteuid()
+    neededuid = os.stat('/etc/confluent').st_uid
+    if curruid != neededuid:
+        os.seteuid(neededuid)
+    if os.geteuid() != neededuid:
+        raise Exception('Need to run as root or owner of /etc/confluent')
+    return curruid
+
 def get_ip_addresses():
-    lines = subprocess.check_output('ip addr'.split(' '))
+    lines, _ = util.run(['ip', 'addr'])
     if not isinstance(lines, str):
         lines = lines.decode('utf8')
     for line in lines.split('\n'):
@@ -68,40 +85,21 @@ def get_certificate_paths():
 
 def assure_tls_ca():
     keyout, certout = ('/etc/confluent/tls/cakey.pem', '/etc/confluent/tls/cacert.pem')
-    if os.path.exists(certout):
-        return
-    try:
-        os.makedirs('/etc/confluent/tls')
-    except OSError as e:
-        if e.errno != 17:
-            raise
-    sslcfg = get_openssl_conf_location()
-    tmpconfig = tempfile.mktemp()
-    shutil.copy2(sslcfg, tmpconfig)
-    subprocess.check_call(
-        ['openssl', 'ecparam', '-name', 'secp384r1', '-genkey', '-out',
-         keyout])
-    try:
-        with open(tmpconfig, 'a') as cfgfile:
-            cfgfile.write('\n[CACert]\nbasicConstraints = CA:true\n')
-        subprocess.check_call([
-            'openssl', 'req', '-new', '-x509', '-key', keyout, '-days',
-            '27300', '-out', certout, '-subj',
-            '/CN=Confluent TLS Certificate authority ({0})'.format(socket.gethostname()),
-            '-extensions', 'CACert', '-config', tmpconfig
-        ])
-    finally:
-        os.remove(tmpconfig)
-    # Could restart the webserver now?
+    if not os.path.exists(certout):
+        #create_simple_ca(keyout, certout)
+        create_full_ca(certout)
     fname = '/var/lib/confluent/public/site/tls/{0}.pem'.format(
         collective.get_myname())
+    ouid = normalize_uid()
     try:
         os.makedirs(os.path.dirname(fname))
     except OSError as e:
         if e.errno != 17:
             raise
+    finally:
+        os.seteuid(ouid)
     shutil.copy2('/etc/confluent/tls/cacert.pem', fname)
-    hv = subprocess.check_output(
+    hv, _ = util.run(
         ['openssl', 'x509', '-in', '/etc/confluent/tls/cacert.pem', '-hash', '-noout'])
     if not isinstance(hv, str):
         hv = hv.decode('utf8')
@@ -118,6 +116,93 @@ def assure_tls_ca():
             except OSError:
                 pass
     os.symlink(certname, hashname)
+
+def substitute_cfg(setting, key, val, newval, cfgfile, line):
+    if key.strip() == setting:
+        cfgfile.write(line.replace(val, newval) + '\n')
+        return True
+    return False
+
+def create_full_ca(certout):
+    mkdirp('/etc/confluent/tls/ca/private')
+    keyout = '/etc/confluent/tls/ca/private/cakey.pem'
+    csrout = '/etc/confluent/tls/ca/ca.csr'
+    mkdirp('/etc/confluent/tls/ca/newcerts')
+    with open('/etc/confluent/tls/ca/index.txt', 'w') as idx:
+        pass
+    with open('/etc/confluent/tls/ca/index.txt.attr', 'w') as idx:
+        idx.write('unique_subject = no')
+    with open('/etc/confluent/tls/ca/serial', 'w') as srl:
+        srl.write('01')
+    sslcfg = get_openssl_conf_location()
+    newcfg = '/etc/confluent/tls/ca/openssl.cfg'
+    settings = {
+        'dir': '/etc/confluent/tls/ca',
+        'certificate': '$dir/cacert.pem',
+        'private_key': '$dir/private/cakey.pem',
+        'countryName': 'optional',
+        'stateOrProvinceName': 'optional',
+        'organizationName': 'optional',
+    }
+    subj = '/CN=Confluent TLS Certificate authority ({0})'.format(socket.gethostname())
+    if len(subj) > 68:
+        subj = subj[:68]
+    with open(sslcfg, 'r') as cfgin:
+        with open(newcfg, 'w') as cfgfile:
+            for line in cfgin.readlines():
+                cfg = line.split('#')[0]
+                if '=' in cfg:
+                    key, val = cfg.split('=', 1)
+                    for stg in settings:
+                        if substitute_cfg(stg, key, val, settings[stg], cfgfile, line):
+                            break
+                    else:
+                        cfgfile.write(line.strip() + '\n')
+                    continue
+                cfgfile.write(line.strip() + '\n')
+            cfgfile.write('\n[CACert]\nbasicConstraints = CA:true\n\n[ca_confluent]\n')
+    subprocess.check_call(
+        ['openssl', 'ecparam', '-name', 'secp384r1', '-genkey', '-out',
+        keyout])
+    subprocess.check_call(
+        ['openssl', 'req', '-new', '-key', keyout, '-out', csrout, '-subj', subj])
+    subprocess.check_call(
+        ['openssl', 'ca', '-config', newcfg, '-batch', '-selfsign',
+        '-extensions', 'CACert', '-extfile', newcfg, 
+        '-notext', '-startdate',
+         '19700101010101Z', '-enddate', '21000101010101Z', '-keyfile',
+         keyout, '-out', '/etc/confluent/tls/ca/cacert.pem', '-in', csrout]
+    )
+    shutil.copy2('/etc/confluent/tls/ca/cacert.pem', certout)
+#openssl ca -config openssl.cnf -selfsign -keyfile cakey.pem -startdate 20150214120000Z -enddate 20160214120000Z
+#20160107071311Z -enddate 20170106071311Z
+
+def create_simple_ca(keyout, certout):
+    try:
+        os.makedirs('/etc/confluent/tls')
+    except OSError as e:
+        if e.errno != 17:
+            raise
+    sslcfg = get_openssl_conf_location()
+    tmphdl, tmpconfig = tempfile.mkstemp()
+    os.close(tmphdl)
+    shutil.copy2(sslcfg, tmpconfig)
+    subprocess.check_call(
+            ['openssl', 'ecparam', '-name', 'secp384r1', '-genkey', '-out',
+            keyout])
+    try:
+        subj = '/CN=Confluent TLS Certificate authority ({0})'.format(socket.gethostname())
+        if len(subj) > 68:
+            subj = subj[:68]
+        with open(tmpconfig, 'a') as cfgfile:
+            cfgfile.write('\n[CACert]\nbasicConstraints = CA:true\n')
+        subprocess.check_call([
+                'openssl', 'req', '-new', '-x509', '-key', keyout, '-days',
+                '27300', '-out', certout, '-subj', subj,
+                '-extensions', 'CACert', '-config', tmpconfig
+            ])
+    finally:
+        os.remove(tmpconfig)
 
 def create_certificate(keyout=None, certout=None):
     if not keyout:
@@ -138,10 +223,14 @@ def create_certificate(keyout=None, certout=None):
     #san.append('DNS:{0}'.format(longname))
     san = ','.join(san)
     sslcfg = get_openssl_conf_location()
-    tmpconfig = tempfile.mktemp()
-    extconfig = tempfile.mktemp()
-    csrout = tempfile.mktemp()
+    tmphdl, tmpconfig = tempfile.mkstemp()
+    os.close(tmphdl)
+    tmphdl, extconfig = tempfile.mkstemp()
+    os.close(tmphdl)
+    tmphdl, csrout = tempfile.mkstemp()
+    os.close(tmphdl)
     shutil.copy2(sslcfg, tmpconfig)
+    serialnum = '0x' + ''.join(['{:02x}'.format(x) for x in bytearray(os.urandom(20))])
     try:
         with open(tmpconfig, 'a') as cfgfile:
             cfgfile.write('\n[SAN]\nsubjectAltName={0}'.format(san))
@@ -152,13 +241,21 @@ def create_certificate(keyout=None, certout=None):
             '/CN={0}'.format(longname),
             '-extensions', 'SAN', '-config', tmpconfig
         ])
-        subprocess.check_call([
-            'openssl', 'x509', '-req', '-in', csrout,
-            '-CA', '/etc/confluent/tls/cacert.pem',
-            '-CAkey', '/etc/confluent/tls/cakey.pem',
-            '-set_serial', '0x123', '-out', certout, '-days', '27300',
-            '-extfile', extconfig
-        ])
+        if os.path.exists('/etc/confluent/tls/cakey.pem'):
+            subprocess.check_call([
+                'openssl', 'x509', '-req', '-in', csrout,
+                '-CA', '/etc/confluent/tls/cacert.pem',
+                '-CAkey', '/etc/confluent/tls/cakey.pem',
+                '-set_serial', serialnum, '-out', certout, '-days', '27300',
+                '-extfile', extconfig
+            ])
+        else:
+            subprocess.check_call([
+                'openssl', 'ca', '-config', '/etc/confluent/tls/ca/openssl.cfg',
+                '-in', csrout, '-out', certout, '-batch', '-notext',
+                '-startdate', '19700101010101Z', '-enddate', '21000101010101Z',
+                '-extfile', extconfig
+            ])
     finally:
         os.remove(tmpconfig)
         os.remove(csrout)

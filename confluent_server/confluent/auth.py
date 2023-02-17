@@ -22,7 +22,10 @@
 import confluent.config.configmanager as configmanager
 import eventlet
 import eventlet.tpool
-import Cryptodome.Protocol.KDF as KDF
+try:
+    import Cryptodome.Protocol.KDF as KDF
+except ImportError:
+    import Crypto.Protocol.KDF as KDF
 from fnmatch import fnmatch
 import hashlib
 import hmac
@@ -72,6 +75,7 @@ _allowedbyrole = {
             '/node*/configuration/*',
         ],
         'start': [
+            '/sessions/current/async',
             '/nodes/*/console/session*',
             '/nodes/*/shell/sessions*',
         ],
@@ -81,10 +85,16 @@ _allowedbyrole = {
         ],
     },
     'Monitor': {
+        'start': [
+            '/sessions/current/async',
+        ],
         'retrieve': [
             '/node*/health/hardware',
             '/node*/power/state',
             '/node*/sensors/*',
+            '/node*/attributes/current',
+            '/node*/description',
+            '/noderange/*/nodes/',
             '/nodes/',
             '/',
         ],
@@ -162,6 +172,10 @@ def authorize(name, element, tenant=False, operation='create',
         return False
     manager = configmanager.ConfigManager(tenant, username=user)
     userobj = manager.get_user(user)
+    if element and (element.startswith('/sessions/current/webauthn/registered_credentials/') or  element.startswith('/sessions/current/webauthn/validate/')):
+        return userobj, manager, user, tenant, skipuserobj
+    if userobj and userobj.get('role', None) == 'Stub':
+        userobj = None
     if not userobj:
         for group in userutil.grouplist(user):
             userobj = manager.get_usergroup(group)

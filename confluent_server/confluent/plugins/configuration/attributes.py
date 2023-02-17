@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import confluent.exceptions as exc
 import confluent.messages as msg
 import confluent.config.attributes as allattributes
@@ -99,7 +100,7 @@ def retrieve_nodegroup(nodegroup, element, configmanager, inputdata):
                 yield msg.ListAttributes(
                     kv={attribute: currattr},
                     desc=desc)
-            else:
+            elif currattr:
                 print(attribute)
                 print(repr(currattr))
                 raise Exception("BUGGY ATTRIBUTE FOR NODEGROUP")
@@ -148,7 +149,7 @@ def retrieve_nodes(nodes, element, configmanager, inputdata):
                 elif isinstance(currattr, list):
                     yield msg.ListAttributes(
                         node, {attribute: currattr}, desc)
-                else:
+                elif currattr:
                     print(attribute)
                     print(repr(currattr))
                     raise Exception("BUGGY ATTRIBUTE FOR NODE")
@@ -188,6 +189,12 @@ def update_nodegroup(group, element, configmanager, inputdata):
         for attrib in inputdata.attribs:
             if inputdata.attribs[attrib] is None:
                 clearattribs.append(attrib)
+            else:
+                try:
+                    ast.parse(attrib)
+                except SyntaxError as e:
+                    markup = (e.text[:e.offset-1] + '-->' + e.text[e.offset-1] + '<--' + e.text[e.offset:]).strip()
+                    raise exc.InvalidArgumentException('Syntax error in attribute name: "{0}"'.format(markup))
         for attrib in clearattribs:
             del inputdata.attribs[attrib]
         if clearattribs:
@@ -211,7 +218,12 @@ def _expand_expression(nodes, configmanager, inputdata):
             pernodeexpressions[expanded[0]] = expanded[1]
         for node in util.natural_sort(pernodeexpressions):
             yield msg.KeyValueData({'value': pernodeexpressions[node]}, node)
-    except (SyntaxError, ValueError) as e:
+    except SyntaxError as e:
+        markup = (e.text[:e.offset-1] + '-->' + e.text[e.offset-1] + '<--' + e.text[e.offset:]).strip()
+        raise exc.InvalidArgumentException(
+            'Bad confluent expression syntax (must use "{{" and "}}" if not '
+            'desiring confluent expansion): ' + markup)
+    except ValueError as e:
         raise exc.InvalidArgumentException(
             'Bad confluent expression syntax (must use "{{" and "}}" if not '
             'desiring confluent expansion): ' + str(e))
@@ -261,7 +273,11 @@ def update_nodes(nodes, element, configmanager, inputdata):
             for attrib in list(updatenode):
                 if updatenode[attrib] is None:
                     del updatenode[attrib]
-                    if attrib in allattributes.node  or attrib.startswith('custom.') or attrib.startswith('net.'):
+                    if '*' in attrib:
+                        currnodeattrs = configmanager.get_node_attributes(node, attrib)
+                        for matchattrib in currnodeattrs.get(node, {}):
+                            clearattribs.append(matchattrib)
+                    elif attrib in allattributes.node  or attrib.startswith('custom.') or attrib.startswith('net.'):
                         clearattribs.append(attrib)
                     else:
                         foundattrib = False
@@ -271,6 +287,17 @@ def update_nodes(nodes, element, configmanager, inputdata):
                                 foundattrib = True
                         if not foundattrib:
                             raise exc.InvalidArgumentException("No attribute matches '" + attrib + "' (try wildcard if trying to clear a group)")
+                elif '*' in attrib:
+                    currnodeattrs = configmanager.get_node_attributes(node, attrib)
+                    for matchattrib in currnodeattrs.get(node, {}):
+                        updatenode[matchattrib] = updatenode[attrib]
+                    del updatenode[attrib]
+                else:
+                    try:
+                        ast.parse(attrib)
+                    except SyntaxError as e:
+                        markup = (e.text[:e.offset-1] + '-->' + e.text[e.offset-1] + '<--' + e.text[e.offset:]).strip()
+                        raise exc.InvalidArgumentException('Syntax error in attribute name: "{0}"'.format(markup))
             if len(clearattribs) > 0:
                 configmanager.clear_node_attributes([node], clearattribs)
             updatedict[node] = updatenode

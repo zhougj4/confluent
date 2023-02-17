@@ -110,7 +110,7 @@ def exithandler():
 
 atexit.register(exithandler)
 
-_ipmiworkers = greenpool.GreenPool(128)
+_ipmiworkers = greenpool.GreenPool(512)
 
 _ipmithread = None
 _ipmiwaiters = []
@@ -256,6 +256,7 @@ def get_conn_params(node, configdata):
         bmc = configdata['hardwaremanagement.manager']['value']
     else:
         bmc = node
+    bmc = bmc.split('/', 1)[0]
     if 'secret.ipmikg' in configdata:
         kg = configdata['secret.ipmikg']['value']
     else:
@@ -482,7 +483,7 @@ class IpmiHandler(object):
         self.tenant = cfg.tenant
         tenant = cfg.tenant
         while ((node, tenant) not in persistent_ipmicmds or
-                not persistent_ipmicmds[(node, tenant)].ipmi_session.logged or
+                not (persistent_ipmicmds[(node, tenant)].ipmi_session.logged or persistent_ipmicmds[(node, tenant)].ipmi_session.logging) or
                 persistent_ipmicmds[(node, tenant)].ipmi_session.broken):
             try:
                 persistent_ipmicmds[(node, tenant)].close_confluent()
@@ -514,6 +515,11 @@ class IpmiHandler(object):
                     raise exc.TargetEndpointUnreachable(ge.strerror)
                 raise
         self.ipmicmd = persistent_ipmicmds[(node, tenant)]
+        giveup = util.monotonic_time() + 60
+        while not self.ipmicmd.ipmi_session.broken and not self.ipmicmd.ipmi_session.logged and self.ipmicmd.ipmi_session.logging:
+            self.ipmicmd.ipmi_session.wait_for_rsp(3)
+            if util.monotonic_time() > giveup:
+                self.ipmicmd.ipmi_session.broken = True
 
     bootdevices = {
         'optical': 'cd'
@@ -729,11 +735,14 @@ class IpmiHandler(object):
         elif len(self.element) == 4 and self.element[-1] == 'management':
             if self.op == 'read':
                 lancfg = self.ipmicmd.get_net_configuration()
+                v6cfg = self.ipmicmd.get_net6_configuration()
                 self.output.put(msg.NetworkConfiguration(
                     self.node, ipv4addr=lancfg['ipv4_address'],
                     ipv4gateway=lancfg['ipv4_gateway'],
                     ipv4cfgmethod=lancfg['ipv4_configuration'],
-                    hwaddr=lancfg['mac_address']
+                    hwaddr=lancfg['mac_address'],
+                    staticv6addrs=v6cfg.get('static_addrs', ''),
+                    staticv6gateway=v6cfg.get('static_gateway', ''),
                 ))
             elif self.op == 'update':
                 config = self.inputdata.netconfig(self.node)
@@ -742,6 +751,11 @@ class IpmiHandler(object):
                         ipv4_address=config['ipv4_address'],
                         ipv4_configuration=config['ipv4_configuration'],
                         ipv4_gateway=config['ipv4_gateway'])
+                    v6addrs = config.get('static_v6_addresses', None)
+                    if v6addrs is not None:
+                        v6addrs = v6addrs.split(',')
+                    v6gw = config.get('static_v6_gateway', None)
+                    self.ipmicmd.set_net6_configuration(static_addresses=v6addrs, static_gateway=v6gw)
                 except socket.error as se:
                     self.output.put(msg.ConfluentNodeError(self.node,
                                                            se.message))
@@ -801,10 +815,10 @@ class IpmiHandler(object):
                                                    password=user['password'])
                     self.ipmicmd.set_user_password(uid=user['uid'],
                                     mode='enable', password=user['password'])
-                    if 'privilege_level' in user:
-                        self.ipmicmd.set_user_access(uid=user['uid'],
-                                                     privilege_level=user[
-                                                         'privilege_level'])
+                if 'privilege_level' in user:
+                    self.ipmicmd.set_user_access(uid=user['uid'],
+                                                    privilege_level=user[
+                                                        'privilege_level'])
                 if 'enabled' in user:
                     if user['enabled'] == 'yes':
                         mode = 'enable'
@@ -1522,11 +1536,12 @@ class IpmiHandler(object):
                 'directory {0}, check ownership and permissions'.format(
                     checkdir))
         for saved in self.ipmicmd.save_licenses(directory):
-            try:
-                pwent = pwd.getpwnam(self.current_user)
-                os.chown(saved, pwent.pw_uid, pwent.pw_gid)
-            except KeyError:
-                pass
+            if self.current_user:
+                try:
+                    pwent = pwd.getpwnam(self.current_user)
+                    os.chown(saved, pwent.pw_uid, pwent.pw_gid)
+                except KeyError:
+                    pass
             self.output.put(msg.SavedFile(self.node, saved))
 
     def handle_licenses(self):

@@ -7,16 +7,21 @@
 
 nodename=$(grep ^NODENAME /etc/confluent/confluent.info|awk '{print $2}')
 confluent_apikey=$(cat /etc/confluent/confluent.apikey)
-confluent_mgr=$(grep deploy_server /etc/confluent/confluent.deploycfg|awk '{print $2}')
+confluent_mgr=$(grep ^deploy_server: /etc/confluent/confluent.deploycfg|awk '{print $2}')
 confluent_profile=$(grep ^profile: /etc/confluent/confluent.deploycfg|awk '{print $2}')
+timedatectl set-timezone $(grep ^timezone: /etc/confluent/confluent.deploycfg|awk '{print $2}')
 export nodename confluent_mgr confluent_profile
 . /etc/confluent/functions
 mkdir -p /var/log/confluent
+chmod 700 /var/log/confluent
 exec >> /var/log/confluent/confluent-onboot.log
 exec 2>> /var/log/confluent/confluent-onboot.log
+chmod 600 /var/log/confluent/confluent-onboot.log
 tail -f /var/log/confluent/confluent-onboot.log > /dev/console &
 logshowpid=$!
 
+run_remote_python syncfileclient
+run_remote_python confignet
 run_remote onboot.custom
 # onboot scripts may be placed into onboot.d, e.g. onboot.d/01-firstaction.sh, onboot.d/02-secondaction.sh
 run_remote_parts onboot.d

@@ -90,6 +90,12 @@ cfgpaths = {
     'bmc.ipv4_gateway': (
         'configuration/management_controller/net_interfaces/management',
         'ipv4_gateway'),
+    'bmc.static_ipv6_addresses': (
+        'configuration/management_controller/net_interfaces/management',
+        'static_v6_addresses'),
+    'bmc.static_ipv6_gateway': (
+        'configuration/management_controller/net_interfaces/management',
+        'static_v6_gateway'),
     'bmc.hostname': (
         'configuration/management_controller/hostname', 'hostname'),
 }
@@ -289,13 +295,11 @@ else:
     for path in queryparms:
         if options.comparedefault:
             continue
-        rc = client.print_attrib_path(path, session, list(queryparms[path]),
+        rcode |= client.print_attrib_path(path, session, list(queryparms[path]),
                                       NullOpt(), queryparms[path])
-        if rc:
-            sys.exit(rc)
     if printsys == 'all' or printextbmc or printbmc or printallbmc:
         if printbmc or not printextbmc:
-         rcode = client.print_attrib_path(
+         rcode |= client.print_attrib_path(
                         '/noderange/{0}/configuration/management_controller/extended/all'.format(noderange),
                         session, printbmc, options, attrprefix='bmc.')
         if options.extra:

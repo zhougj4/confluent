@@ -22,6 +22,8 @@ import confluent.util as util
 import confluent.client as client
 import confluent.sshutil as sshutil
 import confluent.certutil as certutil
+import confluent.netutil as netutil
+import socket
 try:
     input = raw_input
 except NameError:
@@ -54,6 +56,8 @@ def main(args):
         help='Push profile.yaml of the named profile data into boot assets as appropriate')
     upb.add_argument('profile', help='Profile to update boot assets')
     osls = sp.add_parser('list', help='List OS images available for deployment')
+    ubp = sp.add_parser('rebase', help='Update stock profile content from packaged updates')
+    ubp.add_argument('profile', help='Profile to rebase from packaged content')
     cmdset = ap.parse_args()
 
     if cmdset.command == 'list':
@@ -64,6 +68,8 @@ def main(args):
         return initialize(cmdset)
     if cmdset.command == 'updateboot':
         return updateboot(cmdset.profile)
+    if cmdset.command == 'rebase':
+        return rebase(cmdset.profile)
     ap.print_help()
 
 
@@ -107,13 +113,41 @@ def initialize_genesis():
                         '/var/lib/confluent/public/os/genesis-x86_64/scripts/')
         shutil.copyfile('/opt/confluent/lib/osdeploy/genesis/profiles/default/profile.yaml',
                        '/var/lib/confluent/public/os/genesis-x86_64/profile.yaml')
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(str(e) + '\n')
         retcode = 1
     finally:
         os._exit(retcode)
 
 
+mynamedone = False
+def init_confluent_myname():
+    global mynamedone
+    if mynamedone:
+        return
+    mynamedone = True
+    hasconfluentuser = None
+    neededuid = os.stat('/etc/confluent').st_uid
+    if neededuid == 0:
+        return
+    try:
+        hasconfluentuser = pwd.getpwnam('confluent')
+    except KeyError:
+        pass
+    if hasconfluentuser:
+        print("Ok")
+        pid = os.fork()
+        if pid:
+            os.waitpid(pid, 0)
+        else:
+            os.setgid(hasconfluentuser.pw_gid)
+            os.setuid(hasconfluentuser.pw_uid)
+            collective.get_myname()
+            os._exit(0)
+
+
 def local_node_trust_setup():
+    init_confluent_myname()
     allnodes, domain = selfservice.get_cluster_list()
     myname = collective.get_myname()
     myprincipals = set([myname])
@@ -121,10 +155,13 @@ def local_node_trust_setup():
     neededlines = set([
         'HostbasedAuthentication yes', 'HostbasedUsesNameFromPacketOnly yes',
         'IgnoreRhosts no'])
-    if domain and not myname.endswith(domain):
-        myprincipals.add('{0}.{1}'.format(myname, domain))
-    if domain and '.' in myname and myname.endswith(domain):
-        myprincipals.add(myname.split('.')[0])
+    myshortname = myname.split('.')[0]
+    myprincipals.add(myshortname)
+    if domain:
+        myprincipals.add('{0}.{1}'.format(myshortname, domain))
+    for addr in netutil.get_my_addresses():
+        addr = socket.inet_ntop(addr[0], addr[1])
+        myprincipals.add(addr)
     for pubkey in glob.glob('/etc/ssh/ssh_host_*_key.pub'):
         currpubkey = open(pubkey, 'rb').read()
         cert = sshutil.sign_host_key(currpubkey, myname, myprincipals)
@@ -180,14 +217,24 @@ def install_tftp_content():
     else:
         emprint(
             'Detected {0} as tftp directory, but unable to determine tftp service, ensure that a tftp server is installed and enabled manually'.format(tftplocation))
+    otftplocation = tftplocation
     tftplocation = '{0}/confluent/x86_64'.format(tftplocation)
     try:
         os.makedirs(tftplocation)
     except OSError as e:
         if e.errno != 17:
             raise
+    armtftplocation = '{0}/confluent/aarch64'.format(otftplocation)
+    try:
+        os.makedirs(armtftplocation)
+    except OSError as e:
+        if e.errno != 17:
+            raise
     shutil.copy('/opt/confluent/lib/ipxe/ipxe.efi', tftplocation)
     shutil.copy('/opt/confluent/lib/ipxe/ipxe.kkpxe', tftplocation)
+    if os.path.exists('/opt/confluent/lib/ipxe/ipxe-aarch64.efi'):
+        shutil.copy('/opt/confluent/lib/ipxe/ipxe-aarch64.efi', os.path.join(armtftplocation, 'ipxe.efi'))
+
 
 
 def initialize(cmdset):
@@ -196,22 +243,22 @@ def initialize(cmdset):
         sys.exit(1)
     if cmdset.i:
         didsomething = True
-        sys.stdout.write('Add root user key to be authorized to log into nodes (-u)? (y/n): ')
+        sys.stdout.write('Add root user key to be authorized to log into nodes (-u)? (y/N): ')
         sys.stdout.flush()
         cmdset.u = input().strip().lower().startswith('y')
-        sys.stdout.write('Initialize a profile to boot Genesis on target systems (a small Linux environment for rescue and staging use)? (y/n): ')
+        sys.stdout.write('Initialize a profile to boot Genesis on target systems (a small Linux environment for rescue and staging use)? (y/N): ')
         cmdset.g = input().strip().lower().startswith('y')
-        sys.stdout.write('Set up an SSH authority to help manage known_hosts and node to node ssh for all users (-s)? (y/n): ')
+        sys.stdout.write('Set up an SSH authority to help manage known_hosts and node to node ssh for all users (-s)? (y/N): ')
         cmdset.s = input().strip().lower().startswith('y')
-        sys.stdout.write('Update global known hosts on this server to trust local CA certificates (-k)? (y/n): ')
+        sys.stdout.write('Update global known hosts on this server to trust local CA certificates (-k)? (y/N): ')
         cmdset.k = input().strip().lower().startswith('y')
-        sys.stdout.write('Allow managed nodes to ssh to this management node without a password (-l)? (y/n): ')
+        sys.stdout.write('Allow managed nodes to ssh to this management node without a password (-l)? (y/N): ')
         cmdset.l = input().strip().lower().startswith('y')
-        sys.stdout.write('Update tftp directory with binaries to support PXE (-p) (y/n): ')
+        sys.stdout.write('Update tftp directory with binaries to support PXE (-p) (y/N): ')
         cmdset.p = input().strip().lower().startswith('y')
-        sys.stdout.write('Initialize confluent ssh user key so confluent can execute remote automation (e.g. Ansible plays) (-a) (y/n): ')
+        sys.stdout.write('Initialize confluent ssh user key so confluent can execute remote automation (e.g. Ansible plays) (-a) (y/N): ')
         cmdset.a = input().strip().lower().startswith('y')
-        sys.stdout.write('Generate new TLS certificates for HTTP, replacing any existing certificate (-t)? (y/n): ')
+        sys.stdout.write('Generate new TLS certificates for HTTP, replacing any existing certificate (-t)? (y/N): ')
         cmdset.t = input().strip().lower().startswith('y')
         if not cmdset.t:
             print(
@@ -222,6 +269,13 @@ def initialize(cmdset):
                 'subject.')
     else:
         didsomething = False
+    if not os.path.exists('/etc/confluent/cfg'):
+        sys.stderr.write('Start confluent service prior to initializng OS deployment\n')
+        sys.exit(1)
+    if cmdset.t or cmdset.s or cmdset.a or cmdset.u:
+        neededuid = os.stat('/etc/confluent').st_uid
+        util.mkdirp('/var/lib/confluent')
+        os.chown('/var/lib/confluent', neededuid, -1)
     if cmdset.u:
         didsomething = True
         if not glob.glob('/root/.ssh/*.pub'):
@@ -231,36 +285,74 @@ def initialize(cmdset):
                             'used. ssh-agent may be used to make use of a '
                             'passphrase protected ssh key easier.\n')
             sys.exit(1)
+        init_confluent_myname()
         sshutil.initialize_root_key(False)
     if cmdset.t:
         didsomething = True
+        init_confluent_myname()
         certutil.create_certificate()
         if os.path.exists('/usr/lib/systemd/system/httpd.service'):
-            subprocess.check_call(['systemctl', 'try-restart', 'httpd'])
-            print('HTTP server has been restarted if it was running')
+            try:
+                subprocess.check_call(['systemctl', 'try-restart', 'httpd'])
+                print('HTTP server has been restarted if it was running')
+            except Exception:
+                emprint('New HTTPS certificates generated, restart the web server manually')
         elif os.path.exists('/usr/lib/systemd/system/apache2.service'):
-            subprocess.check_call(['systemctl', 'try-restart', 'apache2'])
-            print('HTTP server has been restarted if it was running')
+            try:
+                subprocess.check_call(['systemctl', 'try-restart', 'apache2'])
+                print('HTTP server has been restarted if it was running')
+            except Exception:
+                emprint('New HTTPS certificates generated, restart the web server manually')
         else:
             emprint('New HTTPS certificates generated, restart the web server manually')
     if cmdset.s:
         didsomething = True
-        sshutil.initialize_ca()
+        init_confluent_myname()
+        try:
+            sshutil.initialize_ca()
+        except sshutil.AlreadyExists:
+            emprint('Skipping generation of SSH CA, already present and would likely be more problematic to regenerate than to reuse (if absolutely sure you want to discard old CA, then delete /etc/confluent/ssh/ca*)')
     if cmdset.a:
         didsomething = True
-        sshutil.initialize_root_key(True, True)
+        init_confluent_myname()
+        try:
+            sshutil.initialize_root_key(True, True)
+        except sshutil.AlreadyExists:
+            emprint('Skipping generation of new automation key, already present and regeneration usually causes more problems. (If absolutely certain, delete /etc/confluent/ssh/automation*)')
     if cmdset.p:
         install_tftp_content()
     if cmdset.l:
         local_node_trust_setup()
     if cmdset.k:
-        with open('/etc/ssh/ssh_known_hosts', 'a+b') as skh:
+        cas = set([])
+        cakeys = set([])
+        try:
+            with open('/etc/ssh/ssh_known_hosts', 'rb') as skh:
+                for line in skh.read().split(b'\n'):
+                    try:
+                        cakey = line.split()[3]
+                        cakeys.add(cakey)
+                    except IndexError:
+                        pass
+                    if line:
+                        cas.add(line)
+        except IOError:
+            pass
+        with open('/etc/ssh/ssh_known_hosts', 'wb') as skh:
+            for ca in cas:
+                skh.write(ca)
+                skh.write(b'\n')
             for cafile in glob.glob('/var/lib/confluent/public/site/ssh/*.ca'):
                 cacert = open(cafile, 'rb').read()
+                cakey = cacert.split()[1]
+                if cakey in cakeys:
+                    continue
                 cacert = b'@cert-authority * ' + cacert
                 skh.write(cacert)
     if cmdset.g:
-        initialize_genesis()
+        rc = initialize_genesis()
+        if rc != 0:
+            sys.exit(rc)
     if not didsomething and (cmdset.k or cmdset.l or cmdset.g or cmdset.p):
         if cmdset.g:
             updateboot('genesis-x86_64')
@@ -275,14 +367,29 @@ def initialize(cmdset):
     topack = []
     opath = os.getcwd()
     os.chdir('/var/lib/confluent/public/site')
-    topack.append('ssh/')
-    for currd, _, files in os.walk('ssh'):
-        for fname in files:
-            topack.append(os.path.join(currd, fname))
-    topack.append('tls/')
-    for currd, _, files in os.walk('tls'):
-        for fname in files:
-            topack.append(os.path.join(currd, fname))
+    totar = []
+    if not os.path.exists('confluent_uuid'):
+        c = client.Command()
+        for rsp in c.read('/uuid'):
+            uuid = rsp.get('uuid', {}).get('value', None)
+            if uuid:
+                with open('confluent_uuid', 'w') as uuidout:
+                    uuidout.write(uuid)
+                    uuidout.write('\n')
+    totar.append('confluent_uuid')
+    topack.append('confluent_uuid')
+    if os.path.exists('ssh'):
+        totar.append('ssh')
+        topack.append('ssh/')
+        for currd, _, files in os.walk('ssh'):
+            for fname in files:
+                topack.append(os.path.join(currd, fname))
+    if os.path.exists('tls'):
+        totar.append('tls')
+        topack.append('tls/')
+        for currd, _, files in os.walk('tls'):
+            for fname in files:
+                topack.append(os.path.join(currd, fname))
     with open(tmpname, 'wb') as initramfs:
         packit = subprocess.Popen(['cpio', '-H', 'newc', '-o'],
                                   stdout=initramfs, stdin=subprocess.PIPE)
@@ -299,11 +406,12 @@ def initialize(cmdset):
     os.rename(tmpname, '/var/lib/confluent/public/site/initramfs.cpio')
     if cmdset.g:
         updateboot('genesis-x86_64')
-    tmptarname = tmpname.replace('cpio', 'tgz')
-    tarcmd = ['tar', '-czf', tmptarname, 'ssh', 'tls']
-    subprocess.check_call(tarcmd)
+    if totar:
+        tmptarname = tmpname.replace('cpio', 'tgz')
+        tarcmd = ['tar', '-czf', tmptarname] + totar
+        subprocess.check_call(tarcmd)
+        os.rename(tmptarname, '/var/lib/confluent/public/site/initramfs.tgz')
     os.chdir(opath)
-    os.rename(tmptarname, '/var/lib/confluent/public/site/initramfs.tgz')
     print('Site initramfs content packed successfully')
 
     if not os.path.exists('/etc/confluent/srvcert.pem'):
@@ -322,12 +430,25 @@ def updateboot(profilename):
             print(repr(rsp))
 
 
+def rebase(profilename):
+    c = client.Command()
+    for rsp in c.update('/deployment/profiles/{0}'.format(profilename), {'rebase': 1}):
+        if 'updated' in rsp:
+            print('Updated: {0}'.format(rsp['updated']))
+        elif 'customized' in rsp:
+            print('Skipping update of {0} as current copy was customized or no manifest data was available'.format(rsp['customized']))
+        elif 'error' in rsp:
+            sys.stderr.write(rsp['error'] + '\n')
+            sys.exit(rsp['errorcode'])
+        else:
+            print(repr(rsp))
+
 def oslist():
     c = client.Command()
     print("Distributions:")
     for rsp in c.read('/deployment/distributions'):
         if 'error' in rsp:
-            sys.stderr.write(res['error'] + '\n')
+            sys.stderr.write(rsp['error'] + '\n')
             exitcode = 1
         else:
             print("  " + rsp['item']['href'].replace('/', ''))
@@ -336,7 +457,7 @@ def oslist():
     print("Profiles:")
     for rsp in c.read('/deployment/profiles'):
         if 'error' in rsp:
-            sys.stderr.write(res['error'] + '\n')
+            sys.stderr.write(rsp['error'] + '\n')
             exitcode = 1
         else:
             print("  " + rsp['item']['href'].replace('/', ''))
@@ -372,6 +493,11 @@ def osimport(imagefile):
                         sys.stdout.write('\n')
                         for profile in rsp['profiles']:
                             print('Deployment profile created: {0}'.format(profile))
+                    if rsp['phase'] == 'error':
+                        sys.stderr.write('{0}\n'.format(rsp['error']))
+                        if 'Permission denied' in rsp['error']:
+                            sys.stderr.write('Confluent service unable to write to destination, check that confluent user has access to target\n')
+                        return
                     sys.stdout.flush()
                 else:
                     print(repr(rsp))

@@ -5,9 +5,12 @@ nodediscover(8)  -- List or manage confluent node discovery
 
 `nodediscover rescan`  
 `nodediscover [options] list`  
-`nodediscover [options] assign`
-`nodediscover [options] rescan`
-`nodediscover [options] clear`
+`nodediscover [options] assign`  
+`nodediscover [options] rescan`  
+`nodediscover [options] clear`  
+`nodediscover [options] subscribe [switch]`  
+`nodediscover [options] unsubscribe [switch]`  
+`nodediscover [options] register [Addresses, e.g. 192.168.1.2 or 192.168.1.0/24 or 192.168.1.1-192.168.1.28]`  
 
 ## DESCRIPTION
 
@@ -34,6 +37,12 @@ scan is the best approach to catch something that appears to be missing.
 
 **nodedsicover clear** requests the server forget about a selection of
 detected device.  It takes the same arguments as **nodediscover list**.
+
+**nodediscover subscribe** and **unsubscribe** instructs confluent to subscribe to or
+unsubscribe from the designated switch running affluent with system discovery support.
+
+**nodediscover register** instructs confluent to perform a remote probe of an address, subnet,
+or range of IP addresses.
 
 ## CSV FORMAT
 

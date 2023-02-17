@@ -29,6 +29,10 @@ import atexit
 import confluent.auth as auth
 import confluent.config.conf as conf
 import confluent.config.configmanager as configmanager
+try:
+    import anydbm as dbm
+except ModuleNotFoundError:
+    import dbm
 import confluent.consoleserver as consoleserver
 import confluent.core as confluentcore
 import confluent.httpapi as httpapi
@@ -59,10 +63,14 @@ import gc
 from greenlet import greenlet
 import sys
 import os
+import glob
 import signal
 import socket
+import subprocess
 import time
 import traceback
+import tempfile
+import uuid
 
 
 def _daemonize():
@@ -209,9 +217,42 @@ def setlimits():
     except Exception:
         pass
 
+def assure_ownership(path):
+    try:
+        if os.getuid() != os.stat(path).st_uid:
+            sys.stderr.write('{} is not owned by confluent user, change ownership\n'.format(path))
+            sys.exit(1)
+    except OSError as e:
+        if e.errno == 13:
+            sys.stderr.write('{} is not owned by confluent user, change ownership\n'.format(path))
+            sys.exit(1)
+
+def sanity_check():
+    if os.getuid() == 0:
+        return True
+    assure_ownership('/etc/confluent')
+    assure_ownership('/etc/confluent/cfg')
+    for filename in glob.glob('/etc/confluent/cfg/*'):
+        assure_ownership(filename)
+    assure_ownership('/etc/confluent/privkey.pem')
+    assure_ownership('/etc/confluent/srvcert.pem')
+
+
+def migrate_db():
+    tdir = tempfile.mkdtemp()
+    subprocess.check_call(['python3', '-c', 'pass'])
+    subprocess.check_call(['python2', '/opt/confluent/bin/confluentdbutil', 'dump', '-u', tdir])
+    subprocess.check_call(['python3', '/opt/confluent/bin/confluentdbutil', 'restore', '-u', tdir])
+    subprocess.check_call(['rm', '-rf', tdir])
+    configmanager.init()
+
 
 def run(args):
     setlimits()
+    try:
+        configmanager.ConfigManager(None)
+    except dbm.error:
+        migrate_db()
     try:
         signal.signal(signal.SIGUSR1, dumptrace)
     except AttributeError:
@@ -226,6 +267,7 @@ def run(args):
         sys.stderr.write("Error unlocking credential store\n")
         doexit()
         sys.exit(1)
+    sanity_check()
     try:
         confluentcore.load_plugins()
     except:
@@ -245,6 +287,12 @@ def run(args):
     signal.signal(signal.SIGINT, terminate)
     signal.signal(signal.SIGTERM, terminate)
     atexit.register(doexit)
+    confluentuuid = configmanager.get_global('confluent_uuid')
+    if not confluentuuid:
+        confluentuuid = str(uuid.uuid4())
+        configmanager.set_global('confluent_uuid', confluentuuid)
+    if not configmanager._masterkey:
+        configmanager.init_masterkey()
     if dbgif:
         oumask = os.umask(0o077)
         try:
@@ -278,7 +326,6 @@ def run(args):
         except Exception:
             eventlet.sleep(0.5)
     disco.start_detection()
-    pxe.start_proxydhcp()
     eventlet.sleep(1)
     consoleserver.start_console_sessions()
     while 1:

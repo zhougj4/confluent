@@ -1,9 +1,12 @@
-#!/usr/bin/python
+#!/usr/bin/python3
+import subprocess
 import importlib
 import tempfile
 import json
 import os
 import shutil
+import pwd
+import grp
 from importlib.machinery import SourceFileLoader
 try:
     apiclient = SourceFileLoader('apiclient', '/opt/confluent/bin/apiclient').load_module()
@@ -25,7 +28,7 @@ def partitionhostsline(line):
     names = names.split()
     return ipaddr, names, comment
 
-class HostMerger:
+class HostMerger(object):
     def __init__(self):
         self.byip = {}
         self.byname = {}
@@ -75,8 +78,12 @@ class HostMerger:
     def write_out(self, targetfile):
         while not self.targlines[-1]:
             self.targlines = self.targlines[:-1]
+            if not self.targlines:
+                break
         while not self.sourcelines[-1]:
             self.sourcelines = self.sourcelines[:-1]
+            if not self.sourcelines:
+                break
         with open(targetfile, 'w') as hosts:
             for line in self.targlines:
                 hosts.write(line + '\n')
@@ -129,12 +136,14 @@ class CredMerger:
                 except ValueError:
                     continue
                 if targfile:
-                    if uid <= minid or uid >= maxid:
+                    if uid < minid or uid > maxid:
                         self.targdata.append(line)
                     else:
                         self.discardnames[name] = 1
                 else:
-                    if uid >= minid and uid <= maxid:
+                    if name[0] in ('+', '#', '@'):
+                        self.sourcedata.append(line)
+                    elif uid >= minid and uid <= maxid:
                         self.sourcedata.append(line)
 
     def read_shadow(self, source):
@@ -167,6 +176,8 @@ class CredMerger:
                     shadout.write(line + '\n')
                 for line in self.sourcedata:
                     name, _ = line.split(':', 1)
+                    if name[0] in ('+', '#', '@'):
+                        continue
                     if name in self.shadowednames:
                         continue
                     shadout.write(name + ':!:::::::\n')
@@ -182,17 +193,48 @@ class CredMerger:
                         continue
                     shadout.write(name + ':!::\n')
 
+def appendonce(basepath, filename):
+    with open(filename, 'rb') as filehdl:
+        thedata = filehdl.read()
+    targname = filename.replace(basepath, '')
+    try:
+        with open(targname, 'rb') as filehdl:
+            targdata = filehdl.read()
+    except IOError:
+        targdata = b''
+    if thedata in targdata:
+        return
+    with open(targname, 'ab') as targhdl:
+        targhdl.write(thedata)
+
 def synchronize():
     tmpdir = tempfile.mkdtemp()
+    appendoncedir = tempfile.mkdtemp()
     try:
         ac = apiclient.HTTPSClient()
-        data = json.dumps({'merge': tmpdir})
+        myips = []
+        ipaddrs = subprocess.check_output(['ip', '-br', 'a']).split(b'\n')
+        for line in ipaddrs:
+            isa = line.split()
+            if len(isa) < 3 or isa[1] != b'UP':
+                continue
+            for addr in isa[2:]:
+                if addr.startswith(b'fe80::') or addr.startswith(b'169.254'):
+                    continue
+                addr = addr.split(b'/')[0]
+                if not isinstance(addr, str):
+                    addr = addr.decode('utf8')
+                myips.append(addr)
+        data = json.dumps({'merge': tmpdir, 'appendonce': appendoncedir, 'myips': myips})
         status, rsp = ac.grab_url_with_status('/confluent-api/self/remotesyncfiles', data)
         if status == 202:
+            lastrsp = ''
             while status != 204:
                 status, rsp = ac.grab_url_with_status('/confluent-api/self/remotesyncfiles')
                 if not isinstance(rsp, str):
                     rsp = rsp.decode('utf8')
+                if status == 200:
+                    lastrsp = rsp
             pendpasswd = os.path.join(tmpdir, 'etc/passwd')
             if os.path.exists(pendpasswd):
                 cm = CredMerger()
@@ -211,8 +253,33 @@ def synchronize():
                 cm.read_source(pendhosts)
                 cm.read_target('/etc/hosts')
                 cm.write_out('/etc/hosts')
+            for dirn in os.walk(appendoncedir):
+                for filen in dirn[2]:
+                    appendonce(appendoncedir, os.path.join(dirn[0], filen))
+            if lastrsp:
+                lastrsp = json.loads(lastrsp)
+                opts = lastrsp.get('options', {})
+                for fname in opts:
+                    uid = -1
+                    gid = -1
+                    for opt in opts[fname]:
+                        if opt == 'owner':
+                            try:
+                                uid = pwd.getpwnam(opts[fname][opt]['name']).pw_uid
+                            except KeyError:
+                                uid = opts[fname][opt]['id']
+                        elif opt == 'group':
+                            try:
+                                gid = grp.getgrnam(opts[fname][opt]['name']).gr_gid
+                            except KeyError:
+                                gid = opts[fname][opt]['id']
+                        elif opt == 'permissions':
+                            os.chmod(fname, int(opts[fname][opt], 8))
+                    if uid != -1 or gid != -1:
+                        os.chown(fname, uid, gid)
     finally:
         shutil.rmtree(tmpdir)
+        shutil.rmtree(appendoncedir)
 
 
 if __name__ == '__main__':

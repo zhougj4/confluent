@@ -26,6 +26,25 @@ import re
 import socket
 import ssl
 import struct
+import eventlet.green.subprocess as subprocess
+
+
+def mkdirp(path):
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != 17:
+            raise
+
+
+def run(cmd):
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stdout, stderr = process.communicate()
+    retcode = process.poll()
+    if retcode:
+        raise subprocess.CalledProcessError(retcode, process.args, output=stdout)
+    return stdout, stderr
+
 
 def stringify(instr):
     # Normalize unicode and bytes to 'str', correcting for
@@ -43,6 +62,8 @@ def list_interface_indexes():
     try:
         for iface in os.listdir('/sys/class/net/'):
             if not os.path.exists('/sys/class/net/{0}/ifindex'.format(iface)):
+                continue
+            if os.path.exists('/sys/class/net/{0}/bonding_slave'.format(iface)):
                 continue
             ifile = open('/sys/class/net/{0}/ifindex'.format(iface), 'r')
             intidx = int(ifile.read())
@@ -127,12 +148,24 @@ def get_fingerprint(certificate, algo='sha512'):
         return 'sha256$' + hashlib.sha256(certificate).hexdigest()
     elif algo == 'sha512':
         return 'sha512$' + hashlib.sha512(certificate).hexdigest()
+    elif algo == 'sha384':
+        return 'sha384$' + hashlib.sha384(certificate).hexdigest()
     raise Exception('Unsupported fingerprint algorithm ' + algo)
 
+
+hashlens = {
+    48: hashlib.sha384,
+    64: hashlib.sha512,
+    32: hashlib.sha256
+}
 
 def cert_matches(fingerprint, certificate):
     if not fingerprint or not certificate:
         return False
+    if '$' not in fingerprint:
+        fingerprint = base64.b64decode(fingerprint)
+        algo = hashlens[len(fingerprint)]
+        return algo(certificate).digest() == fingerprint
     algo, _, fp = fingerprint.partition('$')
     newfp = None
     if algo in ('sha512', 'sha256'):

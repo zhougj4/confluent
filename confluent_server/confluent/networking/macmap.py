@@ -170,9 +170,17 @@ def _affluent_map_switch(args):
                 if mac in _nodesbymac and _nodesbymac[mac][0] != nodename:
                     # For example, listed on both a real edge port
                     # and by accident a trunk port
-                    log.log({'error': '{0} and {1} described by ambiguous'
-                                    ' switch topology values'.format(
-                                        nodename, _nodesbymac[mac][0])})
+                    onummacs = _nodesbymac[mac][1]
+                    onode = _nodesbymac[mac][0]
+                    if onode:
+                        errstr = 'Mac address {2} may match either {0} or {1} according to net.*switch* attributes.'.format(nodename, onode, mac)
+                        if onummacs > 2 or nummacs > 2:
+                            errstr += ' ({0} may match a switch trunk)'.format(nodename if nummacs > onummacs else onode)
+                    else:
+                        errstr = 'Mac address {1} may match either {0} or a node previously reported as ambiguous according to net.*switch* attributes.'.format(nodename, mac)
+                        if nummacs > 2:
+                            errstr += ' ({0} may match a switch trunk)'.format(nodename)
+                    log.log({'error': errstr})
                     _nodesbymac[mac] = (None, None)
                 else:
                     _nodesbymac[mac] = (nodename, nummacs)
@@ -212,7 +220,10 @@ def _start_offloader():
 
 
 def _recv_offload():
-    upacker = msgpack.Unpacker(encoding='utf8')
+    try:
+        upacker = msgpack.Unpacker(encoding='utf8')
+    except TypeError:
+        upacker = msgpack.Unpacker(raw=False, strict_map_key=False)
     instream = _offloader.stdout.fileno()
     while True:
         select.select([_offloader.stdout], [], [])
@@ -252,6 +263,11 @@ def _map_switch_backend(args):
     if switch not in noaffluent:
         try:
             return _affluent_map_switch(args)
+        except exc.PubkeyInvalid:
+            log.log({'error': 'While trying to gather ethernet mac addresses '
+                              'from {0}, the TLS certificate failed validation. '
+                              'Clear pubkeys.tls_hardwaremanager if this was '
+                              'expected due to reinstall or new certificate'.format(switch)})
         except Exception:
             pass
     mactobridge, ifnamemap, bridgetoifmap = _offload_map_switch(
@@ -306,9 +322,19 @@ def _map_switch_backend(args):
             if mac in _nodesbymac and _nodesbymac[mac][0] != nodename:
                 # For example, listed on both a real edge port
                 # and by accident a trunk port
-                log.log({'error': '{0} and {1} described by ambiguous'
-                                  ' switch topology values'.format(
-                                      nodename, _nodesbymac[mac][0])})
+                nummacs = maccounts[ifname]
+                onummacs = _nodesbymac[mac][1]
+                onode = _nodesbymac[mac][0]
+                if onode:
+                    errstr = 'Mac address {2} may match either {0} or {1} according to net.*switch* attributes.'.format(nodename, onode, mac)
+                    if onummacs > 2 or nummacs > 2:
+                        errstr += ' ({0} may match a link between switches)'.format(nodename if nummacs > onummacs else onode)
+                else:
+                    errstr = 'Mac address {1} may match either {0} or a node previously reported as ambiguous according to net.*switch* attributes.'.format(nodename, mac)
+                    if nummacs > 2:
+                        errstr += ' ({0} may match a link between switches)'.format(nodename)
+                log.log({'error': errstr})
+                
                 _nodesbymac[mac] = (None, None)
             else:
                 _nodesbymac[mac] = (nodename, maccounts[ifname])
@@ -578,7 +604,7 @@ def handle_read_api_request(pathcomponents, configmanager):
     elif len(pathcomponents) == 2:
         if pathcomponents[-1] == 'macs':
             return [msg.ChildCollection(x) for x in (# 'by-node/',
-                                                     'by-mac/', 'by-switch/',
+                                                     'alldata', 'by-mac/', 'by-switch/',
                                                      'rescan')]
         elif pathcomponents[-1] == 'neighbors':
             return [msg.ChildCollection('by-switch/')]
@@ -593,6 +619,8 @@ def handle_read_api_request(pathcomponents, configmanager):
         elif len(pathcomponents) == 4:
             macaddr = pathcomponents[-1].replace('-', ':')
             return dump_macinfo(macaddr)
+    elif pathcomponents[2] == 'alldata':
+        return [msg.KeyValueData(_apimacmap)]
     elif pathcomponents[2] == 'by-mac':
         if len(pathcomponents) == 3:
             return [msg.ChildCollection(x.replace(':', '-'))
@@ -664,7 +692,10 @@ def rescan(cfg):
 
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == '-o':
-        upacker = msgpack.Unpacker(encoding='utf8')
+        try:
+            upacker = msgpack.Unpacker(encoding='utf8')
+        except TypeError:
+            upacker = msgpack.Unpacker(raw=False, strict_map_key=False)
         currfl = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETFL)
         fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, currfl | os.O_NONBLOCK)
 

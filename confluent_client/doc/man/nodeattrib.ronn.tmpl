@@ -34,7 +34,13 @@ For the `groups` attribute, it is possible to add a group by doing
 `groups,=<newgroup>` and to remove by doing `groups^=<oldgroup>`
 
 Note that `nodeattrib <group>` will likely not provide the expected behavior.
-See nodegroupattrib(8) command on how to manage attributes on a group level.
+See nodegroupattrib(8) command on how to manage attributes on a group level.  Running
+nodeattrib on a group will simply set node-specific attributes on each individual
+member of the group.
+
+Additionally, if wanting to change from a node level attribute value to inherit from a
+member group, it is required to use '-c' to clear the attribute.  Conversely, assigning
+to a blank value will allow masking a group defined attribute with an empty value.
 
 ## OPTIONS
 
@@ -77,12 +83,12 @@ See nodegroupattrib(8) command on how to manage attributes on a group level.
     `# nodeattrib n1,n2 hardwaremanagement --blame`  
     `n1: hardwaremanagement.manager: 172.30.3.1`  
     `n1: hardwaremanagement.method: ipmi (inherited from group everything)`  
-    `n1: hardwaremanagement.switch: r8e1`  
-    `n1: hardwaremanagement.switchport: 14`  
+    `n1: net.switch: r8e1`  
+    `n1: net.switchport: 14`  
     `n2: hardwaremanagement.manager: 172.30.3.2`  
     `n2: hardwaremanagement.method: ipmi (inherited from group everything)`  
-    `n2: hardwaremanagement.switch: r8e1`  
-    `n2: hardwaremanagement.switchport: 2`  
+    `n2: net.switch: r8e1`  
+    `n2: net.switchport: 2`  
 
 * Listing matching nodes of a simple noderange that are set:
     `# nodeattrib n1-n2 current`  

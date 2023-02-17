@@ -42,7 +42,7 @@ if ! grep console= /proc/cmdline >& /dev/null; then
     autocons=${autocons##*/}
     echo "Automatic console configured for $autocons"
 fi
-echo "Initializng confluent diskless environment"
+echo "Initializing confluent diskless environment"
 echo -n "udevd: "
 /usr/lib/systemd/systemd-udevd --daemon
 echo -n "Loading drivers..."
@@ -102,7 +102,10 @@ done
 cd /
 nodename=$(grep ^NODENAME /etc/confluent/confluent.info|awk '{print $2}')
 hostname $nodename
-confluent_mgr=$(grep ^MANAGER: /etc/confluent/confluent.info|head -n 1 | awk '{print $2}')
+confluent_mgr=$(grep '^EXTMGRINFO:.*1$' /etc/confluent/confluent.info | head -n 1|awk -F': ' '{print $2}' | awk -F'|' '{print $1}')
+if [ -z "$confluent_mgr" ]; then
+    confluent_mgr=$(grep ^MANAGER: /etc/confluent/confluent.info|head -n 1 | awk '{print $2}')
+fi
 if [[ $confluent_mgr == *%* ]]; then
     echo $confluent_mgr | awk -F% '{print $2}' > /tmp/confluent.ifidx
     ifidx=$(cat /tmp/confluent.ifidx)
@@ -130,6 +133,7 @@ while [ $ready = "0" ]; do
     fi
     rm $tmperr
 done
+if [ ! -z "$autocons" ] && grep textconsole: true /etc/confluent/confluent.deploycfg > /dev/null; then /opt/confluent/bin/autocons -c > /dev/null; fi
 tpm2_pcrextend 15:sha256=2fbe96c50dde38ce9cd2764ddb79c216cfbcd3499568b1125450e60c45dd19f2
 umask $oldumask
 autoconfigmethod=$(grep ipv4_method /etc/confluent/confluent.deploycfg |awk '{print $2}')

@@ -126,6 +126,7 @@ class ConsoleHandler(object):
                                   'collective.manager'))
 
     def __init__(self, node, configmanager, width=80, height=24):
+        self.termprefix = 'c_'
         self.clearpending = False
         self.clearerror = False
         self.initsize = (width, height)
@@ -143,6 +144,7 @@ class ConsoleHandler(object):
         #self.termstream.attach(self.buffer)
         self.livesessions = set([])
         self.utf8decoder = codecs.getincrementaldecoder('utf-8')()
+        self.pendingbytes = None
         if self._logtobuffer:
             self.logger = log.Logger(node, console=True,
                                      tenant=configmanager.tenant)
@@ -186,8 +188,16 @@ class ConsoleHandler(object):
     def feedbuffer(self, data):
         if not isinstance(data, bytes):
             data = data.encode('utf-8')
+        if self.pendingbytes is not None:
+            self.pendingbytes += data
+        self.pendingbytes = b''
+        nodeid = self.termprefix + self.node
         try:
-            send_output(self.node, data)
+            send_output(nodeid, data)
+            data = self.pendingbytes
+            self.pendingbytes = None
+            if data:
+                send_output(nodeid, data)
         except Exception:
             _tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                           event=log.Events.stacktrace)
@@ -539,7 +549,8 @@ class ConsoleHandler(object):
             'connectstate': self.connectstate,
             'clientcount': len(self.livesessions),
         }
-        retdata = get_buffer_output(self.node)
+        nodeid = self.termprefix + self.node
+        retdata = get_buffer_output(nodeid)
         return retdata, connstate
 
     def write(self, data):
@@ -650,6 +661,7 @@ class ProxyConsole(object):
         while data:
             self.data_handler(data)
             data = tlvdata.recv(self.remote)
+        self.remote.close()
 
     def get_buffer_age(self):
         # the server sends a buffer age if appropriate, no need to handle

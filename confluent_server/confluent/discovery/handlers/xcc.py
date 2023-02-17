@@ -30,14 +30,14 @@ import struct
 getaddrinfo = eventlet.support.greendns.getaddrinfo
 
 
-def fixup_uuid(uuidprop):
-    baduuid = ''.join(uuidprop.split())
-    uuidprefix = (baduuid[:8], baduuid[8:12], baduuid[12:16])
-    a = codecs.encode(struct.pack('<IHH', *[int(x, 16) for x in uuidprefix]), 'hex')
+def fixuuid(baduuid):
+    # SMM dumps it out in hex
+    uuidprefix = (baduuid[:8], baduuid[9:13], baduuid[14:18])
+    a = codecs.encode(struct.pack('<IHH', *[int(x, 16) for x in uuidprefix]),
+        'hex')
     a = util.stringify(a)
-    uuid = (a[:8], a[8:12], a[12:16], baduuid[16:20], baduuid[20:])
-    return '-'.join(uuid).upper()
-
+    uuid = (a[:8], a[8:12], a[12:16], baduuid[19:23], baduuid[24:])
+    return '-'.join(uuid).lower()
 
 class LockedUserException(Exception):
     pass
@@ -57,20 +57,79 @@ class NodeHandler(immhandler.NodeHandler):
         self._currcreds = (None, None)
         super(NodeHandler, self).__init__(info, configmanager)
 
+    @property
+    def ipaddr(self):
+        if not self._ipaddr:
+            lla = self.info.get('linklocal', '')
+            tmplla = None
+            if lla:
+                for idx in util.list_interface_indexes():
+                    tmplla = '{0}%{1}'.format(lla, idx)
+                    addr = socket.getaddrinfo(tmplla, 443, 0, socket.SOCK_STREAM)[0][4]
+                    try:
+                        tsock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                        tsock.settimeout(1)
+                        tsock.connect(addr)
+                        tsock.close()
+                        break
+                    except Exception:
+                        continue
+                else:
+                    return ''
+                return tmplla
+        return self._ipaddr if self._ipaddr else ''
+
     @classmethod
     def adequate(cls, info):
         # We can sometimes receive a partially initialized SLP packet
         # This is not adequate for being satisfied
         return bool(info.get('attributes', {}))
 
+    def probe(self):
+        return None
+
     def scan(self):
-        c = webclient.SecureHTTPConnection(self.ipaddr, 443,
+        ip, port = self.get_web_port_and_ip()
+        c = webclient.SecureHTTPConnection(ip, port,
             verifycallback=self.validate_cert)
         i = c.grab_json_response('/api/providers/logoninfo')
         modelname = i.get('items', [{}])[0].get('machine_name', None)
         if modelname:
             self.info['modelname'] = modelname
-        super(NodeHandler, self).scan()
+        for attrname in list(self.info.get('attributes', {})):
+            val = self.info['attributes'][attrname]
+            if '-uuid' == attrname[-5:] and len(val) == 32:
+                val = val.lower()
+                self.info['attributes'][attrname] = '-'.join([val[:8], val[8:12], val[12:16], val[16:20], val[20:]])
+        attrs = self.info.get('attributes', {})
+        room = attrs.get('room-id', None)
+        if room:
+            self.info['room'] = room
+        rack = attrs.get('rack-id', None)
+        if rack:
+            self.info['rack'] = rack
+        name = attrs.get('name', None)
+        if name:
+            self.info['hostname'] = name
+        unumber = attrs.get('lowest-u', None)
+        if unumber:
+            self.info['u'] = unumber
+        location = attrs.get('location', None)
+        if location:
+            self.info['location'] = location
+        mtm = attrs.get('enclosure-machinetype-model', None)
+        if mtm:
+            self.info['modelnumber'] = mtm.strip()
+        sn = attrs.get('enclosure-serial-number', None)
+        if sn:
+            self.info['serialnumber'] = sn.strip()
+        if attrs.get('enclosure-form-factor', None) == 'dense-computing':
+            encuuid = attrs.get('chassis-uuid', None)
+            if encuuid:
+                self.info['enclosure.uuid'] = fixuuid(encuuid)
+            slot = int(attrs.get('slot', 0))
+            if slot != 0:
+                self.info['enclosure.bay'] = slot
 
     def preconfig(self, possiblenode):
         self.tmpnodename = possiblenode
@@ -78,16 +137,18 @@ class NodeHandler(immhandler.NodeHandler):
         if ff not in ('dense-computing', [u'dense-computing']):
             # skip preconfig for non-SD530 servers
             return
-        currfirm = self.info.get('attributes', {}).get('firmware-image-info', [''])[0]
-        if not currfirm.startswith('TEI'):
+        currfirm = self.info.get('attributes', {}).get('firmware-image-info', [{}])[0]
+        if not currfirm.get('build', '').startswith('TEI'):
             return
         self.trieddefault = None  # Reset state on a preconfig attempt
         # attempt to enable SMM
         #it's normal to get a 'not supported' (193) for systems without an SMM
         # need to branch on 3.00+ firmware
-        currfirm = currfirm.split(':')
-        if len(currfirm) > 1:
-            currfirm = float(currfirm[1])
+        currfirm = currfirm.get('version', '0.0')
+        if currfirm:
+            currfirm = float(currfirm)
+        else:
+            currfirm = 0
         disableipmi = False
         if currfirm >= 3:
             # IPMI is disabled and we need it, also we need to go to *some* password
@@ -148,6 +209,11 @@ class NodeHandler(immhandler.NodeHandler):
                             })
         headers = {'Connection': 'keep-alive',
                    'Content-Type': 'application/json'}
+        rsp, status = wc.grab_json_response_with_status('/api/providers/get_nonce', {})
+        nonce = None
+        if status == 200:
+             nonce = rsp.get('nonce', None)
+             headers['Content-Security-Policy'] = 'nonce={0}'.format(nonce)
         wc.request('POST', '/api/login', adata, headers)
         rsp = wc.getresponse()
         try:
@@ -164,6 +230,14 @@ class NodeHandler(immhandler.NodeHandler):
                 })
             headers = {'Connection': 'keep-alive',
                        'Content-Type': 'application/json'}
+            if nonce:
+                wc.request('POST', '/api/providers/get_nonce', '{}')
+                rsp = wc.getresponse()
+                tokbody = rsp.read()
+                if rsp.status == 200:
+                    rsp = json.loads(tokbody)
+                    nonce = rsp.get('nonce', None)
+                    headers['Content-Security-Policy'] = 'nonce={0}'.format(nonce)
             wc.request('POST', '/api/login', adata, headers)
             rsp = wc.getresponse()
             try:
@@ -186,6 +260,20 @@ class NodeHandler(immhandler.NodeHandler):
             if '_csrf_token' in wc.cookies:
                 wc.set_header('X-XSRF-TOKEN', wc.cookies['_csrf_token'])
             if rspdata.get('pwchg_required', None) == 'true':
+                if newpassword is None:
+                    # a normal login hit expired condition
+                    tmppassword = 'Tmp42' + password[5:]
+                    wc.request('POST', '/api/function', json.dumps(
+                        {'USER_UserPassChange': '1,{0}'.format(tmppassword)}))
+                    rsp = wc.getresponse()
+                    rsp.read()
+                    # We must step down change interval and reusecycle to restore password
+                    wc.grab_json_response('/api/dataset', {'USER_GlobalMinPassChgInt': '0', 'USER_GlobalMinPassReuseCycle': '0'})
+                    wc.request('POST', '/api/function', json.dumps(
+                        {'USER_UserPassChange': '1,{0}'.format(password)}))
+                    rsp = wc.getresponse()
+                    rsp.read()
+                    return (wc, {})
                 wc.request('POST', '/api/function', json.dumps(
                     {'USER_UserPassChange': '1,{0}'.format(newpassword)}))
                 rsp = wc.getresponse()
@@ -214,8 +302,9 @@ class NodeHandler(immhandler.NodeHandler):
         isdefault = True
         errinfo = {}
         if self._wc is None:
+            ip, port = self.get_web_port_and_ip()
             self._wc = webclient.SecureHTTPConnection(
-                self.ipaddr, 443, verifycallback=self.validate_cert)
+                ip, port, verifycallback=self.validate_cert)
             self._wc.connect()
         nodename = None
         if self.nodename:
@@ -340,7 +429,25 @@ class NodeHandler(immhandler.NodeHandler):
                 rsp, status = wc.grab_json_response_with_status(
                     '/api/function',
                     {'USER_UserModify': '{0},{1},,1,Administrator,0,0,0,0,,8,'.format(uid, username)})
+            elif status == 200 and rsp.get('return', 0) == 13:
+                rsp, status = wc.grab_json_response_with_status(
+                    '/api/function',
+                    {'USER_UserModify': '{0},{1},,1,4,0,0,0,0,,8,,,'.format(uid, username)})
+                if status == 200 and rsp.get('return', 0) == 13:
+                    wc.set_basic_credentials(self._currcreds[0], self._currcreds[1])
+                    status = 503
+                    while status != 200:
+                        rsp, status = wc.grab_json_response_with_status(
+                            '/redfish/v1/AccountService/Accounts/{0}'.format(uid),
+                            {'UserName': username}, method='PATCH')
+                        if status != 200:
+                            rsp = json.loads(rsp)
+                            if rsp.get('error', {}).get('code', 'Unknown') in ('Base.1.8.GeneralError', 'Base.1.12.GeneralError'):
+                                eventlet.sleep(10)
+                            else:
+                                break
             self.tmppasswd = None
+        wc.grab_json_response('/api/providers/logout')
         self._currcreds = (username, passwd)
 
     def _convert_sha256account(self, user, passwd, wc):
@@ -371,6 +478,13 @@ class NodeHandler(immhandler.NodeHandler):
                     'password': tpass,
                 })
                 headers = {'Connection': 'keep-alive', 'Content-Type': 'application/json'}
+                wc.request('POST', '/api/providers/get_nonce', '{}')
+                rsp = wc.getresponse()
+                tokbody = rsp.read()
+                if rsp.status == 200:
+                    rsp = json.loads(tokbody)
+                    nonce = rsp.get('nonce', None)
+                    headers['Content-Security-Policy'] = 'nonce={0}'.format(nonce)
                 nwc.request('POST', '/api/login', adata, headers)
                 rsp = nwc.getresponse()
                 if rsp.status == 200:
@@ -406,6 +520,16 @@ class NodeHandler(immhandler.NodeHandler):
 
     def config(self, nodename, reset=False):
         self.nodename = nodename
+        cd = self.configmanager.get_node_attributes(
+            nodename, ['secret.hardwaremanagementuser',
+                       'secret.hardwaremanagementpassword',
+                       'hardwaremanagement.manager', 'hardwaremanagement.method', 'console.method'],
+                       True)
+        cd = cd.get(nodename, {})
+        targbmc = cd.get('hardwaremanagement.manager', {}).get('value', '')
+        if not self.ipaddr.startswith('fe80::') and (targbmc.startswith('fe80::') or not targbmc):
+            raise exc.TargetEndpointUnreachable(
+                'hardwaremanagement.manager must be set to desired address (No IPv6 Link Local detected)')
         # TODO(jjohnson2): set ip parameters, user/pass, alert cfg maybe
         # In general, try to use https automation, to make it consistent
         # between hypothetical secure path and today.
@@ -425,13 +549,8 @@ class NodeHandler(immhandler.NodeHandler):
                     'Request to use default credentials, but refused by target after it has been changed to {0}'.format(self.tmppasswd))
             if not isdefault:
                 self._setup_xcc_account(user, passwd, wc)
+                wc = self.wc
         self._convert_sha256account(user, passwd, wc)
-        cd = self.configmanager.get_node_attributes(
-            nodename, ['secret.hardwaremanagementuser',
-                       'secret.hardwaremanagementpassword',
-                       'hardwaremanagement.manager', 'hardwaremanagement.method', 'console.method'],
-                       True)
-        cd = cd.get(nodename, {})
         if (cd.get('hardwaremanagement.method', {}).get('value', 'ipmi') != 'redfish'
                 or cd.get('console.method', {}).get('value', None) == 'ipmi'):
             nwc = wc.dupe()
@@ -443,16 +562,27 @@ class NodeHandler(immhandler.NodeHandler):
                 _, _ = nwc.grab_json_response_with_status(
                         '/redfish/v1/Managers/1/NetworkProtocol',
                         {'IPMI': {'ProtocolEnabled': True}}, method='PATCH')
-        if ('hardwaremanagement.manager' in cd and
-                cd['hardwaremanagement.manager']['value'] and
-                not cd['hardwaremanagement.manager']['value'].startswith(
-                    'fe80::')):
-            newip = cd['hardwaremanagement.manager']['value']
+            rsp, status = nwc.grab_json_response_with_status(
+                '/redfish/v1/AccountService/Accounts/1')
+            if status == 200:
+                allowable = rsp.get('AccountTypes@Redfish.AllowableValues', [])
+                current = rsp.get('AccountTypes', [])
+                if 'IPMI' in allowable and 'IPMI' not in current:
+                    current.append('IPMI')
+                    updateinf = {
+                        'AccountTypes': current,
+                        'Password': self._currcreds[1]
+                    }
+                    rsp, status = nwc.grab_json_response_with_status(
+                        '/redfish/v1/AccountService/Accounts/1',
+                        updateinf, method='PATCH')
+        if targbmc and not targbmc.startswith('fe80::'):
+            newip = targbmc.split('/', 1)[0]
             newipinfo = getaddrinfo(newip, 0)[0]
             newip = newipinfo[-1][0]
             if ':' in newip:
                 raise exc.NotImplementedException('IPv6 remote config TODO')
-            netconfig = netutil.get_nic_config(self.configmanager, nodename, ip=newip)
+            netconfig = netutil.get_nic_config(self.configmanager, nodename, ip=targbmc)
             newmask = netutil.cidr_to_mask(netconfig['prefix'])
             currinfo = wc.grab_json_response('/api/providers/logoninfo')
             currip = currinfo.get('items', [{}])[0].get('ipv4_address', '')
@@ -464,6 +594,8 @@ class NodeHandler(immhandler.NodeHandler):
                     }
                 if netconfig['ipv4_gateway']:
                     statargs['ENET_IPv4GatewayIPAddr'] = netconfig['ipv4_gateway']
+                elif not netutil.address_is_local(newip):
+                    raise exc.InvalidArgumentException('Will not remotely configure a device with no gateway')
                 wc.grab_json_response('/api/dataset', statargs)
         elif self.ipaddr.startswith('fe80::'):
             self.configmanager.set_node_attributes(
@@ -475,7 +607,7 @@ class NodeHandler(immhandler.NodeHandler):
         ff = self.info.get('attributes', {}).get('enclosure-form-factor', '')
         if ff not in ('dense-computing', [u'dense-computing']):
             return
-        enclosureuuid = self.info.get('attributes', {}).get('chassis-uuid', [None])[0]
+        enclosureuuid = self.info.get('enclosure.uuid', None)
         if enclosureuuid:
             enclosureuuid = enclosureuuid.lower()
             em = self.configmanager.get_node_attributes(nodename,
@@ -492,6 +624,7 @@ def remote_nodecfg(nodename, cfm):
             nodename, 'hardwaremanagement.manager')
     ipaddr = cfg.get(nodename, {}).get('hardwaremanagement.manager', {}).get(
         'value', None)
+    ipaddr = ipaddr.split('/', 1)[0]
     ipaddr = getaddrinfo(ipaddr, 0)[0][-1]
     if not ipaddr:
         raise Excecption('Cannot remote configure a system without known '

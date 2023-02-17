@@ -168,7 +168,9 @@ class pam():
                             currcpassword = c_char_p(currpassword.encode('utf8'))
                     else:
                         currpassword = password
-                        currcpassword = c_char_p(password.encode('utf8'))
+                        if not isinstance(currpassword, bytes):
+                            currpassword = currpassword.encode('utf8')
+                        currcpassword = c_char_p(currpassword)
                     dst = calloc(len(currpassword)+1, sizeof(c_char))
                     memmove(dst, currcpassword, len(currpassword))
                     response[i].resp = dst
@@ -240,10 +242,10 @@ if __name__ == "__main__":
         readline.set_pre_input_hook(hook)
 
         if sys.version_info >= (3,):
-            result = input(prompt)
+            getinput = input
         else:
-            result = raw_input(prompt)
-
+            getinput = raw_input
+        result = getinput(prompt)
         readline.set_pre_input_hook()
         return result
 

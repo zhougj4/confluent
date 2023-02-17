@@ -13,6 +13,7 @@ if [ -f "/run/install/cmdline.d/01-autocons.conf" ]; then
 fi
 exec >> /tmp/confluent-pre.log
 exec 2>> /tmp/confluent-pre.log
+chmod 600 /tmp/confluent-pre.log
 tail -f /tmp/confluent-pre.log > /dev/tty &
 logshowpid=$!
 nodename=$(grep ^NODENAME /etc/confluent/confluent.info|awk '{print $2}')
@@ -78,5 +79,9 @@ if [ -e /tmp/installdisk -a ! -e /tmp/partitioning ]; then
     echo ignoredisk --only-use $(cat /tmp/installdisk) >> /tmp/partitioning
     echo autopart --nohome $LUKSPARTY >> /tmp/partitioning
 fi
-python /etc/confluent/apiclient /confluent-public/os/$confluent_profile/kickstart.custom -o /tmp/kickstart.custom
+if [ -f /opt/confluent/bin/apiclient ]; then
+    python /opt/confluent/bin/apiclient /confluent-public/os/$confluent_profile/kickstart.custom -o /tmp/kickstart.custom
+else
+    python /etc/confluent/apiclient /confluent-public/os/$confluent_profile/kickstart.custom -o /tmp/kickstart.custom
+fi
 kill $logshowpid

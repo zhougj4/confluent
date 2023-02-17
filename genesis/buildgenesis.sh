@@ -1,17 +1,61 @@
-cd $(dirname $0)
+pushd $(dirname $0)
+rm -rf licenses
 cp -a 97genesis /usr/lib/dracut/modules.d/
 cat /usr/lib/dracut/modules.d/97genesis/install-* > /usr/lib/dracut/modules.d/97genesis/install
 chmod +x /usr/lib/dracut/modules.d/97genesis/install /usr/lib/dracut/modules.d/97genesis/installkernel
 mkdir -p boot/initramfs
 mkdir -p boot/efi/boot
 dracut --no-early-microcode --xz -N -m "genesis base" -f boot/initramfs/distribution $(uname -r)
+tdir=$(mktemp -d)
+tfile=$(mktemp)
+cp boot/initramfs/distribution $tdir
+pushd $tdir
+xzcat distribution|cpio -dumi
+rm distribution
+find . -type f -exec rpm -qf /{} \; 2> /dev/null | grep -v 'not owned' | sort -u > $tfile
+find . -type f -printf "%p: " -exec rpm -qf /{} \; 2> /dev/null | grep -v 'not owned' > /tmp/attributedrpmlist
+popd
+rm -rf $tdir
+cp $tfile rpmlist
+cp confluent-genesis.spec confluent-genesis-out.spec
+python3 getlicenses.py rpmlist > /tmp/tmpliclist
+if [ $? -ne 0 ]; then
+    exit 1
+fi
+for lic in $(cat /tmp/tmpliclist); do
+    lo=${lic#/usr/share/}
+    lo=${lo#licenses/}
+    fname=$(basename $lo)
+    dlo=$(dirname $lo)
+    if [[ "$dlo" == *"-lib"* ]]; then
+        dlo=${dlo/-*}
+    elif [[ "$dlo" == "device-mapper-"* ]]; then
+	dlo=${dlo/-*}-mapper
+    elif [[ "$dlo" == "bind-"* ]]; then
+	dlo=${dlo/-*}
+    elif [[ "$dlo" == "iproute-"* ]]; then
+	dlo=${dlo/-*}
+    fi
+    mkdir -p licenses/$dlo
+    if [ "$fname" == "lgpl-2.1.txt" ]; then
+	fname=COPYING.LIB
+    fi
+    cp $lic licenses/$dlo/$fname
+    lo=$dlo/$fname
+    echo %license /opt/confluent/genesis/%{arch}/licenses/$lo >> confluent-genesis-out.spec
+done
+mkdir -p licenses/ipmitool
+cp /usr/share/doc/ipmitool/COPYING  licenses/ipmitool
+echo %license /opt/confluent/genesis/%{arch}/licenses/ipmitool/COPYING >> confluent-genesis-out.spec
 cp -f /boot/vmlinuz-$(uname -r) boot/kernel
 cp /boot/efi/EFI/BOOT/BOOTX64.EFI boot/efi/boot
-cp /boot/efi/EFI/centos/grubx64.efi boot/efi/boot/grubx64.efi
-tar cf ~/rpmbuild/SOURCES/confluent-genesis.tar boot
-rpmbuild -bb confluent-genesis.spec
+find /boot/efi -name grubx64.efi -exec cp {} boot/efi/boot/grubx64.efi \;
+mkdir -p ~/rpmbuild/SOURCES/
+tar cf ~/rpmbuild/SOURCES/confluent-genesis.tar boot rpmlist licenses
+rpmbuild -bb confluent-genesis-out.spec
 rm -rf /usr/lib/dracut/modules.d/97genesis
-cd -
+popd
+# for rpm in $(cat ../rpmlist); do dnf download --source $rpm; done
 # getting src rpms would be nice, but centos isn't consistent..
 # /usr/lib/dracut/skipcpio /opt/confluent/genesis/x86_64/boot/initramfs/distribution | xzcat | cpio -dumiv
 # rpm -qf $(find . -type f | sed -e 's/^.//') |sort -u|grep -v 'not owned' > ../rpmlist

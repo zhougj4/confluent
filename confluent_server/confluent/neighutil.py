@@ -15,52 +15,98 @@
 # limitations under the License.
 
 # A consolidated manage of neighbor table information management.
-# Ultimately, this should use AF_NETLINK, but in the interest of time,
-# use ip neigh for the moment
 
+import confluent.netutil as netutil
 import confluent.util as util
-import eventlet.green.subprocess as subprocess
 import os
+import eventlet.semaphore as semaphore
+import eventlet.green.socket as socket
+import struct
+
+
+def msg_align(len):
+    return (len + 3) & ~3
+
 
 neightable = {}
 neightime = 0
 
 import re
 
-_validmac = re.compile('..:..:..:..:..:..')
+neighlock = semaphore.Semaphore()
 
-
-def update_neigh():
+def _update_neigh():
     global neightable
     global neightime
-    neightable = {}
-    if os.name == 'nt':
-        return
-    ipn = subprocess.Popen(['ip', 'neigh'], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE)
-    (neighdata, err) = ipn.communicate()
-    neighdata = util.stringify(neighdata)
-    for entry in neighdata.split('\n'):
-        entry = entry.split(' ')
-        if len(entry) < 5 or not entry[4]:
-            continue
-        if entry[0] in ('192.168.0.100', '192.168.70.100', '192.168.70.125'):
-            # Note that these addresses are common static ip addresses
-            # that are hopelessly ambiguous if there are many
-            # so ignore such entries and move on
-            # ideally the system network steers clear of this landmine of
-            # a subnet, but just in case
-            continue
-        if not _validmac.match(entry[4]):
-            continue
-        neightable[entry[0]] = entry[4]
     neightime = os.times()[4]
+    s = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE)
+    s.bind((0, 0))
+    # RTM_GETNEIGH
+    # nlmsghdr struct: u32 len, u16 type, u16 flags, u32 seq, u32 pid
+    nlhdr = b'\x1c\x00\x00\x00\x1e\x00\x01\x03\x00\x00\x00\x00\x00\x00\x00\x00'
+    # ndmsg struct u8 family u8 pad, u16 pad, s32 ifidx, u16 state, u8 flags, u8 type
+    ndmsg=  b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+    s.sendall(nlhdr + ndmsg)
+    neightable = {}
+    try:
+        while True:
+            pdata = s.recv(65536)
+            v = memoryview(pdata)
+            if struct.unpack('H', v[4:6])[0] == 3:
+                break
+            while len(v):
+                length, typ = struct.unpack('IH', v[:6])
+                if typ == 28:
+                    hlen = struct.calcsize('BIHBB')
+                    _, idx, state, flags, typ = struct.unpack('BIHBB', v[16:16+hlen])
+                    if typ == 1:  # only handle unicast entries
+                        curraddr = None
+                        currip = None
+                        rta = v[16+hlen:length]
+                        while len(rta):
+                            rtalen, rtatyp = struct.unpack('HH', rta[:4])
+                            if rtatyp == 2:  # hwaddr
+                                curraddr = rta[4:rtalen].tobytes()
+                                if len(curraddr) == 20:
+                                    curraddr = curraddr[12:]
+                            elif rtatyp == 1:  # ip address
+                                currip = rta[4:rtalen].tobytes()
+                            rta = rta[msg_align(rtalen):]
+                            if not rtalen:
+                                break
+                        if curraddr and currip:
+                            neightable[currip] = curraddr
+                v = v[msg_align(length):]
+    finally:
+        s.close()
 
 
-def refresh_neigh():
-    global neightime
+def get_hwaddr(ipaddr):
+    if '%' in ipaddr:
+        ipaddr, _ = ipaddr.split('%', 1)
+    hwaddr = None
     if os.name == 'nt':
-        return
-    if os.times()[4] > (neightime + 30):
-        update_neigh()
+        return hwaddr
+    if ':' in ipaddr:
+        ipaddr = socket.inet_pton(socket.AF_INET6, ipaddr)
+    elif '.' in ipaddr:
+        ipaddr = socket.inet_pton(socket.AF_INET, ipaddr)
+    with neighlock:
+        updated = False
+        if os.times()[4] > (neightime + 30):
+            _update_neigh()
+            updated = True
+        hwaddr = neightable.get(ipaddr, None)
+        if not hwaddr and not netutil.ipn_is_local(ipaddr):
+            hwaddr = False
+        if hwaddr == None and not updated:
+            _update_neigh()
+            hwaddr = neightable.get(ipaddr, None)
+    if hwaddr:
+        hwaddr = ':'.join(['{:02x}'.format(x) for x in bytearray(hwaddr)])
+    return hwaddr
+
+
+if __name__ == '__main__':
+    import sys
+    print(repr(get_hwaddr(sys.argv[1])))

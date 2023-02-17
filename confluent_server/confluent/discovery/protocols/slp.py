@@ -31,7 +31,7 @@ _slp_services = set([
     'service:lenovo-smm2',
     'service:ipmi',
     'service:lighttpd',
-    'service:management-hardware.Lenovo:lenovo-xclarity-controller',
+    #'service:management-hardware.Lenovo:lenovo-xclarity-controller',
     'service:management-hardware.IBM:chassis-management-module',
     'service:management-hardware.Lenovo:chassis-management-module',
     'service:io-device.Lenovo:management-module',
@@ -99,21 +99,25 @@ def _parse_SrvRply(parsed):
         parsed['urls'].append(url)
 
 
-def _parse_slp_packet(packet, peer, rsps, xidmap):
+def _parse_slp_packet(packet, peer, rsps, xidmap, defer=None, sock=None):
     parsed = _parse_slp_header(packet)
     if not parsed:
         return
     addr = peer[0]
-    if '%' in addr:
-        addr = addr[:addr.index('%')]
-    mac = None
-    if addr not in neighutil.neightable:
-        neighutil.update_neigh()
-    if addr in neighutil.neightable:
-        identifier = neighutil.neightable[addr]
-        mac = identifier
+    mac = neighutil.get_hwaddr(addr)
+    if mac:
+        identifier = mac
     else:
-        identifier = addr
+        if defer is None:
+            identifier = addr
+        else:
+            probepeer = (peer[0], struct.unpack('H', os.urandom(2))[0] | 1025) + peer[2:]
+            try:
+                sock.sendto(b'\x00', probepeer)
+            except Exception:
+                return
+            defer.append((packet, peer))
+            return
     if (identifier, parsed['xid']) in rsps:
         # avoid obviously duplicate entries
         parsed = rsps[(identifier, parsed['xid'])]
@@ -201,6 +205,7 @@ def _find_srvtype(net, net4, srvtype, addresses, xid):
     :param addresses:  Pass through of addresses argument from find_targets
     :return:
     """
+    data = _generate_request_payload(srvtype, True, xid)
     if addresses is not None:
         for addr in addresses:
             for saddr in socket.getaddrinfo(addr, 427):
@@ -209,7 +214,6 @@ def _find_srvtype(net, net4, srvtype, addresses, xid):
                 elif saddr[0] == socket.AF_INET6:
                     net.sendto(data, saddr[4])
     else:
-        data = _generate_request_payload(srvtype, True, xid)
         net4.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         v6addrs = []
         v6hash = _v6mcasthash(srvtype)
@@ -246,7 +250,7 @@ def _find_srvtype(net, net4, srvtype, addresses, xid):
             net4.sendto(data, (bcast, 427))
 
 
-def _grab_rsps(socks, rsps, interval, xidmap):
+def _grab_rsps(socks, rsps, interval, xidmap, deferrals):
     r = None
     res = select.select(socks, (), (), interval)
     if res:
@@ -254,8 +258,7 @@ def _grab_rsps(socks, rsps, interval, xidmap):
     while r:
         for s in r:
             (rsp, peer) = s.recvfrom(9000)
-            neighutil.refresh_neigh()
-            _parse_slp_packet(rsp, peer, rsps, xidmap)
+            _parse_slp_packet(rsp, peer, rsps, xidmap, deferrals, s)
             res = select.select(socks, (), (), interval)
             if not res:
                 r = None
@@ -415,11 +418,11 @@ def rescan(handler):
     known_peers = set([])
     for scanned in scan():
         for addr in scanned['addresses']:
-            ip = addr[0].partition('%')[0]  # discard scope if present
-            if ip not in neighutil.neightable:
-                continue
             if addr in known_peers:
                 break
+            macaddr = neighutil.get_hwaddr(addr[0])
+            if not macaddr:
+                continue
             known_peers.add(addr)
         else:
             handler(scanned)
@@ -478,40 +481,27 @@ def snoop(handler, protocol=None):
             # will now yield dupe info over time
             known_peers = set([])
             peerbymacaddress = {}
-            while r:
+            deferpeers = []
+            while r and len(deferpeers) < 256:
                 for s in r:
                     (rsp, peer) = s.recvfrom(9000)
-                    ip = peer[0].partition('%')[0]
                     if peer in known_peers:
                         continue
-                    if ip not in neighutil.neightable:
-                        neighutil.update_neigh()
-                    if ip not in neighutil.neightable:
-                        continue
-                    known_peers.add(peer)
-                    mac = neighutil.neightable[ip]
-                    if mac in peerbymacaddress:
-                        peerbymacaddress[mac]['addresses'].append(peer)
-                    else:
-                        q = query_srvtypes(peer)
-                        if not q or not q[0]:
-                            # SLP might have started and not ready yet
-                            # ignore for now
-                            known_peers.discard(peer)
+                    mac = neighutil.get_hwaddr(peer[0])
+                    if not mac:
+                        probepeer = (peer[0], struct.unpack('H', os.urandom(2))[0] | 1025) + peer[2:]
+                        try:
+                            s.sendto(b'\x00', probepeer)
+                        except Exception:
                             continue
-                        # we want to prioritize the very well known services
-                        svcs = []
-                        for svc in q:
-                            if svc in _slp_services:
-                                svcs.insert(0, svc)
-                            else:
-                                svcs.append(svc)
-                        peerbymacaddress[mac] = {
-                            'services': svcs,
-                            'addresses': [peer],
-                        }
-                    newmacs.add(mac)
+                        deferpeers.append(peer)
+                        continue
+                    process_peer(newmacs, known_peers, peerbymacaddress, peer)
                 r, _, _ = select.select((net, net4), (), (), 0.2)
+            if deferpeers:
+                eventlet.sleep(2.2)
+                for peer in deferpeers:
+                    process_peer(newmacs, known_peers, peerbymacaddress, peer)
             for mac in newmacs:
                 peerbymacaddress[mac]['xid'] = 1
                 _add_attributes(peerbymacaddress[mac])
@@ -536,18 +526,52 @@ def snoop(handler, protocol=None):
             tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                          event=log.Events.stacktrace)
 
+def process_peer(newmacs, known_peers, peerbymacaddress, peer):
+    mac = neighutil.get_hwaddr(peer[0])
+    if not mac:
+        return
+    known_peers.add(peer)
+    if mac in peerbymacaddress:
+        peerbymacaddress[mac]['addresses'].append(peer)
+    else:
+        try:
+            q = query_srvtypes(peer)
+        except Exception as e:
+            q = None
+        if not q or not q[0]:
+            # SLP might have started and not ready yet
+            # ignore for now
+            known_peers.discard(peer)
+            return
+        # we want to prioritize the very well known services
+        svcs = []
+        for svc in q:
+            if svc in _slp_services:
+                svcs.insert(0, svc)
+            else:
+                svcs.append(svc)
+        peerbymacaddress[mac] = {
+                            'services': svcs,
+                            'addresses': [peer],
+                        }
+    newmacs.add(mac)
+
 
 def active_scan(handler, protocol=None):
     known_peers = set([])
+    toprocess = []
+    # Implement a warmup, inducing neighbor table activity
+    # by kernel and giving 2 seconds for a retry or two if
+    # needed
     for scanned in scan():
         for addr in scanned['addresses']:
-            ip = addr[0].partition('%')[0]  # discard scope if present
-            if ip not in neighutil.neightable:
-                neighutil.update_neigh()
-            if ip not in neighutil.neightable:
-                continue
             if addr in known_peers:
                 break
+            macaddr = neighutil.get_hwaddr(addr[0])
+            if not macaddr:
+                continue
+            if not scanned.get('hwaddr', None):
+                scanned['hwaddr'] = macaddr
             known_peers.add(addr)
         else:
             scanned['protocol'] = protocol
@@ -585,15 +609,21 @@ def scan(srvtypes=_slp_services, addresses=None, localonly=False):
     # First we give fast repsonders of each srvtype individual chances to be
     # processed, mitigating volume of response traffic
     rsps = {}
+    deferrals = []
     for srvtype in srvtypes:
         xididx += 1
         _find_srvtype(net, net4, srvtype, addresses, initxid + xididx)
         xidmap[initxid + xididx] = srvtype
-        _grab_rsps((net, net4), rsps, 0.1, xidmap)
-        # now do a more slow check to work to get stragglers,
-        # but fortunately the above should have taken the brunt of volume, so
-        # reduced chance of many responses overwhelming receive buffer.
-    _grab_rsps((net, net4), rsps, 1, xidmap)
+        _grab_rsps((net, net4), rsps, 0.1, xidmap, deferrals)
+    # now do a more slow check to work to get stragglers,
+    # but fortunately the above should have taken the brunt of volume, so
+    # reduced chance of many responses overwhelming receive buffer.
+    _grab_rsps((net, net4), rsps, 1, xidmap, deferrals)
+    if deferrals:
+        eventlet.sleep(1.2)  # already have a one second pause from select above
+        for defer in deferrals:
+            rsp, peer = defer
+            _parse_slp_packet(rsp, peer, rsps, xidmap)
     # now to analyze and flesh out the responses
     handleids = set([])
     gp = eventlet.greenpool.GreenPool(128)

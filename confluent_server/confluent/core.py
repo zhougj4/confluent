@@ -47,6 +47,7 @@ import confluent.messages as msg
 import confluent.networking.macmap as macmap
 import confluent.noderange as noderange
 import confluent.osimage as osimage
+import confluent.plugin as plugin
 try:
     import confluent.shellmodule as shellmodule
 except ImportError:
@@ -70,7 +71,9 @@ import struct
 import sys
 
 pluginmap = {}
-dispatch_plugins = (b'ipmi', u'ipmi', b'redfish', u'redfish', b'tsmsol', u'tsmsol')
+dispatch_plugins = (b'ipmi', u'ipmi', b'redfish', u'redfish', b'tsmsol', u'tsmsol', b'geist', u'geist', b'deltapdu', u'deltapdu', b'eatonpdu', u'eatonpdu', b'affluent', u'affluent', b'cnos', u'cnos')
+
+PluginCollection = plugin.PluginCollection
 
 try:
     unicode
@@ -131,24 +134,39 @@ def load_plugins():
                     pluginmap[name] = tmpmod
             else:
                 pluginmap[plugin] = tmpmod
+                _register_resource(tmpmod)
+        plugins.clear()
         # restore path to not include the plugindir
         sys.path.pop(1)
+    disco.register_affluent(pluginmap['affluent'])
+
+
+def _register_resource(plugin):
+    global noderesources
+    if 'custom_resources' in plugin.__dict__:
+        _merge_dict(noderesources, plugin.custom_resources)
+
+
+def _merge_dict(original, custom):
+    for k,v in custom.items():
+        if k in original:
+            if isinstance(original.get(k), dict):
+                _merge_dict(original.get(k), custom.get(k))
+            else:
+                original[k] = custom.get(k)
+        else:
+            original[k] = custom.get(k)
 
 
 rootcollections = ['deployment/', 'discovery/', 'events/', 'networking/',
                    'noderange/', 'nodes/', 'nodegroups/', 'usergroups/' ,
-                   'users/', 'version']
+                   'users/', 'uuid', 'version']
 
 
 class PluginRoute(object):
     def __init__(self, routedict):
         self.routeinfo = routedict
 
-
-class PluginCollection(object):
-    def __init__(self, routedict, maxdepth=1):
-        self.routeinfo = routedict
-        self.maxdepth = maxdepth
 
 
 def handle_deployment(configmanager, inputdata, pathcomponents,
@@ -175,10 +193,21 @@ def handle_deployment(configmanager, inputdata, pathcomponents,
             return
         if len(pathcomponents) == 3:
             profname = pathcomponents[-1]
-            if operation == 'update' and 'updateboot' in inputdata:
-                osimage.update_boot(profname)
-                yield msg.KeyValueData({'updated': profname})
-                return
+            if operation == 'update':
+                if 'updateboot' in inputdata:
+                    osimage.update_boot(profname)
+                    yield msg.KeyValueData({'updated': profname})
+                    return
+                elif 'rebase' in inputdata:
+                    try:
+                        updated, customized = osimage.rebase_profile(profname)
+                    except osimage.ManifestMissing:
+                        raise exc.InvalidArgumentException('Specified profile {0} does not have a manifest.yaml for rebase'.format(profname))
+                    for upd in updated:
+                        yield msg.KeyValueData({'updated': upd})                        
+                    for cust in customized:
+                        yield msg.KeyValueData({'customized': cust})
+                    return
     if pathcomponents[1] == 'importing':
         if len(pathcomponents) == 2 or not pathcomponents[-1]:
             if operation == 'retrieve':
@@ -263,6 +292,10 @@ def _init_core():
                     'default': 'ipmi',
                 }),
                 'domain_name': PluginRoute({
+                    'pluginattrs': ['hardwaremanagement.method'],
+                    'default': 'ipmi',
+                }),
+                'location': PluginRoute({
                     'pluginattrs': ['hardwaremanagement.method'],
                     'default': 'ipmi',
                 }),
@@ -362,6 +395,11 @@ def _init_core():
             'pluginattrs': ['hardwaremanagement.method'],
             'default': 'ipmi',
         }),
+        'deployment': {
+            'ident_image': PluginRoute({
+                'handler': 'identimage'
+            })
+        },
         'events': {
             'hardware': {
                 'log': PluginRoute({
@@ -432,6 +470,8 @@ def _init_core():
                 'pluginattrs': ['hardwaremanagement.method'],
                 'default': 'ipmi',
             }),
+            'inlets': PluginCollection({'handler': 'pdu'}),
+            'outlets': PluginCollection({'pluginattrs': ['hardwaremanagement.method']}),
             'reseat':  PluginRoute({'handler': 'enclosure'}),
         },
         'sensors': {
@@ -646,6 +686,8 @@ def create_group(inputdata, configmanager):
 def create_node(inputdata, configmanager):
     try:
         nodename = inputdata['name']
+        if ' ' in nodename:
+            raise exc.InvalidArgumentException('Name "{0}" is not supported'.format(nodename))
         del inputdata['name']
         attribmap = {nodename: inputdata}
     except KeyError:
@@ -782,21 +824,29 @@ def handle_dispatch(connection, cert, dispatch, peername):
     operation = dispatch['operation']
     pathcomponents = dispatch['path']
     routespec = nested_lookup(noderesources, pathcomponents)
-    inputdata = msg.get_input_message(
-        pathcomponents, operation, inputdata, nodes, dispatch['isnoderange'],
-        configmanager)
+    try:
+        inputdata = msg.get_input_message(
+            pathcomponents, operation, inputdata, nodes, dispatch['isnoderange'],
+            configmanager)
+    except Exception as res:
+        with xmitlock:
+            _forward_rsp(connection, res)
+        keepalive.kill()
+        connection.sendall('\x00\x00\x00\x00\x00\x00\x00\x00')
+        connection.close()
+        return
     plugroute = routespec.routeinfo
-    plugpath = None
     nodesbyhandler = {}
     passvalues = []
     nodeattr = configmanager.get_node_attributes(
         nodes, plugroute['pluginattrs'])
     for node in nodes:
+        plugpath = None
         for attrname in plugroute['pluginattrs']:
             if attrname in nodeattr[node]:
                 plugpath = nodeattr[node][attrname]['value']
-            elif 'default' in plugroute:
-                plugpath = plugroute['default']
+            if not plugpath and 'default' in plugroute:
+                plugpath = plugroute['default'] 
         if plugpath:
             try:
                 hfunc = getattr(pluginmap[plugpath], operation)
@@ -821,6 +871,7 @@ def handle_dispatch(connection, cert, dispatch, peername):
             _forward_rsp(connection, res)
     keepalive.kill()
     connection.sendall('\x00\x00\x00\x00\x00\x00\x00\x00')
+    connection.close()
 
 
 def _forward_rsp(connection, res):
@@ -927,14 +978,18 @@ def handle_node_request(configmanager, inputdata, operation,
     del pathcomponents[0:2]
     passvalues = queue.Queue()
     plugroute = routespec.routeinfo
-    msginputdata = msg.get_input_message(
-        pathcomponents, operation, inputdata, nodes, isnoderange,
-        configmanager)
+    _plugin = None
+
     if 'handler' in plugroute:  # fixed handler definition, easy enough
         if isinstance(plugroute['handler'], str):
             hfunc = getattr(pluginmap[plugroute['handler']], operation)
+            _plugin = pluginmap[plugroute['handler']]
         else:
             hfunc = getattr(plugroute['handler'], operation)
+            _plugin = plugroute['handler']
+        msginputdata = _get_input_data(_plugin, pathcomponents, operation,
+                                       inputdata, nodes, isnoderange,
+                                       configmanager)
         passvalue = hfunc(
             nodes=nodes, element=pathcomponents,
             configmanager=configmanager,
@@ -948,15 +1003,15 @@ def handle_node_request(configmanager, inputdata, operation,
     elif 'pluginattrs' in plugroute:
         nodeattr = configmanager.get_node_attributes(
             nodes, plugroute['pluginattrs'] + ['collective.manager'])
-        plugpath = None
         nodesbymanager = {}
         nodesbyhandler = {}
         badcollnodes = []
         for node in nodes:
+            plugpath = None
             for attrname in plugroute['pluginattrs']:
                 if attrname in nodeattr[node]:
                     plugpath = nodeattr[node][attrname]['value']
-                elif 'default' in plugroute:
+                if not plugpath and 'default' in plugroute:
                     plugpath = plugroute['default']
             if plugpath in dispatch_plugins:
                 cfm.check_quorum()
@@ -974,6 +1029,7 @@ def handle_node_request(configmanager, inputdata, operation,
                     continue
             if plugpath:
                 try:
+                    _plugin = pluginmap[plugpath]
                     hfunc = getattr(pluginmap[plugpath], operation)
                 except KeyError:
                     nodesbyhandler[BadPlugin(node, plugpath).error] = [node]
@@ -991,7 +1047,9 @@ def handle_node_request(configmanager, inputdata, operation,
             workers.spawn(addtoqueue, passvalues, hfunc, {'nodes': nodesbyhandler[hfunc],
                                            'element': pathcomponents,
                 'configmanager': configmanager,
-                'inputdata': msginputdata})
+                'inputdata': _get_input_data(_plugin, pathcomponents,
+                                             operation, inputdata,nodes,
+                                             isnoderange, configmanager)})
         for manager in nodesbymanager:
             numworkers += 1
             workers.spawn(addtoqueue, passvalues, dispatch_request, {
@@ -1010,6 +1068,17 @@ def handle_node_request(configmanager, inputdata, operation,
         #     return passvalues[0]
         # else:
         #     return stripnode(passvalues[0], nodes[0])
+
+
+def _get_input_data(plugin_ext, pathcomponents, operation, inputdata,
+                   nodes, isnoderange, configmanager):
+    if plugin_ext is not None and hasattr(plugin_ext, 'get_input_message'):
+        return plugin_ext.get_input_message(pathcomponents, operation,
+                                            inputdata, nodes, isnoderange,
+                                            configmanager)
+    else:
+        return msg.get_input_message(pathcomponents, operation, inputdata,
+                                     nodes, isnoderange,configmanager)
 
 
 def iterate_queue(numworkers, passvalues, strip=False):
@@ -1049,12 +1118,12 @@ def dispatch_request(nodes, manager, element, configmanager, inputdata,
         remote = ssl.wrap_socket(remote, cert_reqs=ssl.CERT_NONE,
                                  keyfile='/etc/confluent/privkey.pem',
                                  certfile='/etc/confluent/srvcert.pem')
-    except Exception:
+    except Exception as e:
         for node in nodes:
             if a:
                 yield msg.ConfluentResourceUnavailable(
-                    node, 'Collective member {0} is unreachable'.format(
-                        a['name']))
+                    node, 'Collective member {0} is unreachable ({1})'.format(
+                        a['name'], str(e)))
             else:
                 yield msg.ConfluentResourceUnavailable(
                     node,
@@ -1177,6 +1246,12 @@ def handle_path(path, operation, configmanager, inputdata=None, autostrip=True):
             configmanager, inputdata, operation, pathcomponents)
     elif pathcomponents[0] == 'version':
         return (msg.Attributes(kv={'version': confluent.__version__}),)
+    elif pathcomponents[0] == 'uuid':
+        if operation == 'update':
+             with open('/var/lib/confluent/public/site/confluent_uuid', 'r') as uuidf:
+                fsuuid = uuidf.read().strip()
+                cfm.set_global('confluent_uuid', fsuuid)
+        return (msg.Attributes(kv={'uuid': cfm.get_global('confluent_uuid')}),)
     elif pathcomponents[0] == 'usergroups':
         # TODO: when non-administrator accounts exist,
         # they must only be allowed to see their own user

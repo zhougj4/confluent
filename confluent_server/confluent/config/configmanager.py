@@ -42,10 +42,16 @@
 # by passphrase and optionally TPM
 
 
-import Cryptodome.Protocol.KDF as KDF
-from Cryptodome.Cipher import AES
-from Cryptodome.Hash import HMAC
-from Cryptodome.Hash import SHA256
+try:
+    import Cryptodome.Protocol.KDF as KDF
+    from Cryptodome.Cipher import AES
+    from Cryptodome.Hash import HMAC
+    from Cryptodome.Hash import SHA256
+except ImportError:
+    import Crypto.Protocol.KDF as KDF
+    from Crypto.Cipher import AES
+    from Crypto.Hash import HMAC
+    from Crypto.Hash import SHA256
 try:
     import anydbm as dbm
 except ModuleNotFoundError:
@@ -113,7 +119,7 @@ _attraliases = {
     'bmcpass': 'secret.hardwaremanagementpassword',
     'switchpass': 'secret.hardwaremanagementpassword',
 }
-_validroles = ('Administrator', 'Operator', 'Monitor')
+_validroles = ('Administrator', 'Operator', 'Monitor', 'Stub')
 
 membership_callback = None
 
@@ -485,7 +491,7 @@ def attribute_is_invalid(attrname, attrval):
 
 
 def _get_valid_attrname(attrname):
-    if attrname.startswith('net.'):
+    if attrname.startswith('net.') or attrname.startswith('power.'):
         # For net.* attribtues, split on the dots and put back together
         # longer term we might want a generic approach, but
         # right now it's just net. attributes
@@ -546,17 +552,21 @@ def _load_dict_from_dbm(dpath, tdb):
             if elem not in currdict:
                 currdict[elem] = {}
             currdict = currdict[elem]
+        # Pickle is used as the first choice. It is a local self-owned file
+        # and thus not a significant security risk
         try:
             for tk in dbe.keys():
                 tks = confluent.util.stringify(tk)
-                currdict[tks] = cPickle.loads(dbe[tk])
+                currdict[tks] = cPickle.loads(dbe[tk]) # nosec
         except AttributeError:
             tk = dbe.firstkey()
             while tk != None:
                 tks = confluent.util.stringify(tk)
-                currdict[tks] = cPickle.loads(dbe[tk])
+                currdict[tks] = cPickle.loads(dbe[tk]) # nosec
                 tk = dbe.nextkey(tk)
     except dbm.error:
+        if os.path.exists(tdb):
+            raise
         return
 
 
@@ -794,7 +804,7 @@ def commit_clear():
     # currently just 'autosense' which is intended to be active
     # per collective member
     for globvar in _oldcfgstore.get('globals', ()):
-        if globvar.endswith('_key'):
+        if globvar.endswith('_key') or globvar == 'confluent_uuid':
             continue
         _cfgstore['globals'][globvar] = _oldcfgstore['globals'][globvar]
     _oldcfgstore = None
@@ -1009,8 +1019,17 @@ class _ExpressionFormat(string.Formatter):
         self._numbers = None
 
     def get_field(self, field_name, args, kwargs):
+        return field_name, field_name
+
+    def format_field(self, val, format_spec):
+        if ']' in format_spec:
+            field_name = val + ':' + format_spec
+            format_spec = ''
+        else:
+            field_name = val
         parsed = ast.parse(field_name)
-        return self._handle_ast_node(parsed.body[0].value), field_name
+        val = self._handle_ast_node(parsed.body[0].value)
+        return format(val, format_spec)
 
     def _handle_ast_node(self, node):
         if isinstance(node, ast.Num):
@@ -1059,6 +1078,34 @@ class _ExpressionFormat(string.Formatter):
             op = self._supported_ops[optype]
             return op(int(self._handle_ast_node(node.left)),
                       int(self._handle_ast_node(node.right)))
+        elif isinstance(node, ast.Index):
+            return self._handle_ast_node(node.value)
+        elif isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.USub):
+                return 0 - self._handle_ast_node(node.operand)
+            else:
+                raise ValueError("Invalid operation in expression")
+        elif isinstance(node, ast.Subscript):
+            strval = self._handle_ast_node(node.value)
+            if isinstance(node.slice, ast.Slice):
+                lower = node.slice.lower
+                if lower is None:
+                    lower = 0
+                else:
+                    lower = self._handle_ast_node(lower)
+                upper = node.slice.upper
+                if upper is None:
+                    return strval[lower:]
+                else:
+                    upper = self._handle_ast_node(upper)
+                    return strval[lower:upper]
+            else:
+                index = self._handle_ast_node(node.slice)
+                return strval[index]
+        elif isinstance(node, ast.Constant):
+            return node.value
+        else:
+            raise ValueError("Unrecognized expression syntax")
 
     def _expand_attribute(self, key):
         if '_expressionkeys' not in self._nodeobj:
@@ -1126,6 +1173,18 @@ def hook_new_configmanagers(callback):
             callback(ConfigManager(tenant))
     except KeyError:
         pass
+
+
+def attribute_name_is_invalid(attrname):
+    if attrname.startswith('custom.') or attrname.startswith('net.') or attrname.startswith('power.'):
+        return False
+    if '?' in attrname or '*' in attrname:
+        for attr in allattributes.node:
+            if fnmatch.fnmatch(attr, attrname):
+                return False
+        return True
+    attrname = _get_valid_attrname(attrname)
+    return attrname not in allattributes.node
 
 
 class ConfigManager(object):
@@ -1236,6 +1295,9 @@ class ConfigManager(object):
             raise Exception('Invalid Expression')
         if attribute.startswith('secret.'):
             raise Exception('Filter by secret attributes is not supported')
+        if attribute_name_is_invalid(attribute):
+            raise ValueError(
+                '{0} is not a valid attribute name'.format(attribute))
         for node in nodes:
             try:
                 currvals = [self._cfgstore['nodes'][node][attribute]['value']]
@@ -1453,6 +1515,8 @@ class ConfigManager(object):
         groupname = confluent.util.stringify(groupname)
         if groupname in self._cfgstore['usergroups']:
             raise Exception("Duplicate groupname requested")
+        if role is None:
+            role = 'Administrator'
         for candrole in _validroles:
             if candrole.lower().startswith(role.lower()):
                 role = candrole
@@ -1563,6 +1627,8 @@ class ConfigManager(object):
         name = confluent.util.stringify(name)
         if name in self._cfgstore['users']:
             raise Exception("Duplicate username requested")
+        if role is None:
+            role = 'Administrator'
         for candrole in _validroles:
             if candrole.lower().startswith(role.lower()):
                 role = candrole
@@ -1764,7 +1830,7 @@ class ConfigManager(object):
                 if attrib.startswith('crypted.'):
                     if not isinstance(curr[attrib], dict):
                         curr[attrib] = {'value': curr[attrib]}
-                    if 'hashvalue' not in curr[attrib]:
+                    if 'hashvalue' not in curr[attrib] and curr[attrib].get('value', None):
                         curr[attrib]['hashvalue'] = hashcrypt_value(
                             curr[attrib]['value'])
                         if 'grubhashvalue' not in curr[attrib]:
@@ -1795,7 +1861,7 @@ class ConfigManager(object):
                         group))
             if not autocreate and group not in self._cfgstore['nodegroups']:
                 raise ValueError("{0} group does not exist".format(group))
-            for attr in attribmap[group]:
+            for attr in list(attribmap[group]):
                 # first do a pass to normalize out any aliased attribute names
                 if attr in _attraliases:
                     newattr = _attraliases[attr]
@@ -1822,6 +1888,13 @@ class ConfigManager(object):
                         if attribmap[group][attr].get('prepend', False):
                             newnodes = noderange.NodeRange(attribmap[group][attr][
                                 'prepend'], config=self).nodes
+                            pendingnodes = set([])
+                            for newnode in newnodes:
+                                if newnode in currnodes:
+                                    raise ValueError('{0} is already in group {1}'.format(newnode, group))
+                                if newnode in pendingnodes:
+                                    raise ValueError('{0} is listed multiple times')
+                                pendingnodes.add(newnode)
                             attribmap[group][attr] = list(
                                 newnodes) + currnodes
                         elif attribmap[group][attr].get('remove', False):
@@ -2117,6 +2190,8 @@ class ConfigManager(object):
                     ','.join(missingnodes)))
         newnames = set([])
         for name in renamemap:
+            if renamemap[name] in newnames:
+                raise ValueError('Requested to rename multiple nodes to the same name: {0}'.format(renamemap[name]))
             newnames.add(renamemap[name])
         if newnames & currnodes:
             raise ValueError(
@@ -2161,6 +2236,8 @@ class ConfigManager(object):
                     ','.join(missinggroups)))
         newnames = set([])
         for name in renamemap:
+            if renamemap[name] in newnames:
+                raise ValueError('Requested to rename multiple groups to the same name: {0}'.format(name))
             newnames.add(renamemap[name])
         if newnames & currgroups:
             raise ValueError(
@@ -2186,7 +2263,7 @@ class ConfigManager(object):
                 if attrib.startswith('crypted.'):
                     if not isinstance(curr[attrib], dict):
                         curr[attrib] = {'value': curr[attrib]}
-                    if 'hashvalue' not in curr[attrib]:
+                    if 'hashvalue' not in curr[attrib] and curr[attrib].get('value', None):
                         curr[attrib]['hashvalue'] = hashcrypt_value(
                             curr[attrib]['value'])
                         if 'grubhashvalue' not in curr[attrib]:
@@ -2243,6 +2320,13 @@ class ConfigManager(object):
                         if attribmap[node]['groups'].get('prepend', False):
                             newgroups = attribmap[node]['groups'][
                                 'prepend'].split(',')
+                            pendinggroups = set([])
+                            for newgroup in newgroups:
+                                if newgroup in currgroups:
+                                    raise ValueError('Node {0} is already in group {1}'.format(node, newgroup))
+                                if newgroup in pendinggroups:
+                                    raise ValueError('Group {0} has been specified multiple times'.format(newgroup))
+                                pendinggroups.add(newgroup)
                             attribmap[node]['groups'] = newgroups + currgroups
                         elif attribmap[node]['groups'].get('remove', False):
                             delgroups = attribmap[node]['groups'][
@@ -2281,6 +2365,9 @@ class ConfigManager(object):
                     newdict = {'value': attribmap[node][attrname]}
                 else:
                     newdict = attribmap[node][attrname]
+                # add check here, skip None attributes
+                if newdict is None:
+                    continue
                 if 'value' in newdict and attrname.startswith("secret."):
                     newdict['cryptvalue'] = crypt_value(newdict['value'])
                     del newdict['value']
@@ -2385,16 +2472,24 @@ class ConfigManager(object):
                 self.set_group_attributes(tmpconfig[confarea], True)
             elif confarea == 'usergroups':
                 for usergroup in tmpconfig[confarea]:
-                    self.create_usergroup(usergroup)
+                    role = tmpconfig[confarea][usergroup].get('role', 'Administrator')
+                    self.create_usergroup(usergroup, role=role)
             elif confarea == 'users':
                 for user in tmpconfig[confarea]:
-                    uid = tmpconfig[confarea].get('id', None)
-                    displayname = tmpconfig[confarea].get('displayname', None)
-                    self.create_user(user, uid=uid, displayname=displayname)
-                    if 'cryptpass' in tmpconfig[confarea][user]:
-                        self._cfgstore['users'][user]['cryptpass'] = \
-                            tmpconfig[confarea][user]['cryptpass']
-                        _mark_dirtykey('users', user, self.tenant)
+                    ucfg = tmpconfig[confarea][user]
+                    uid = ucfg.get('id', None)
+                    if uid is not None and not isinstance(uid, str):
+                        if isinstance(uid, bytes):
+                            uid = uid.decode('utf8')
+                        else:
+                            uid = uid.encode('utf8')
+                    displayname = ucfg.get('displayname', None)
+                    role = ucfg.get('role', None)
+                    self.create_user(user, uid=uid, displayname=displayname, role=role)
+                    for attrname in ('authid', 'authenticators', 'cryptpass'):
+                        if attrname in tmpconfig[confarea][user]:
+                            self._cfgstore['users'][user][attrname] = tmpconfig[confarea][user][attrname]
+                            _mark_dirtykey('users', user, self.tenant)
         if sync:
             self._bg_sync_to_file()
 
@@ -2492,8 +2587,13 @@ class ConfigManager(object):
         if statelessmode:
             return
         with cls._syncstate:
-            if (cls._syncrunning and cls._cfgwriter is not None and
-                    cls._cfgwriter.isAlive()):
+            isalive = False
+            if cls._cfgwriter is not None:
+                try:
+                    isalive = cls._cfgwriter.isAlive()
+                except AttributeError:
+                    isalive = cls._cfgwriter.is_alive()
+            if (cls._syncrunning and isalive):
                 cls._writepending = True
                 return
             if cls._syncrunning:  # This suggests an unclean write attempt,
@@ -2522,7 +2622,13 @@ class ConfigManager(object):
                     with _dirtylock:
                         dirtyglobals = copy.deepcopy(_cfgstore['dirtyglobals'])
                         del _cfgstore['dirtyglobals']
-                globalf = dbm.open(os.path.join(cls._cfgdir, "globals"), 'c', 384)  # 0600
+                try:
+                    globalf = dbm.open(os.path.join(cls._cfgdir, "globals"), 'c', 384)  # 0600
+                except dbm.error:
+                    if not fullsync:
+                        raise
+                    os.remove(os.path.join(cls._cfgdir, "globals"))
+                    globalf = dbm.open(os.path.join(cls._cfgdir, "globals"), 'c', 384)  # 0600
                 try:
                     for globalkey in dirtyglobals:
                         if globalkey in _cfgstore['globals']:
@@ -2535,8 +2641,15 @@ class ConfigManager(object):
                     globalf.close()
             if fullsync or 'collectivedirty' in _cfgstore:
                 if len(_cfgstore.get('collective', ())) > 1:
-                    collectivef = dbm.open(os.path.join(cls._cfgdir, "collective"),
-                                        'c', 384)
+                    try:
+                        collectivef = dbm.open(os.path.join(cls._cfgdir, 'collective'),
+                                            'c', 384)
+                    except dbm.error:
+                        if not fullsync:
+                            raise
+                        os.remove(os.path.join(cls._cfgdir, 'collective'))
+                        collectivef = dbm.open(os.path.join(cls._cfgdir, 'collective'),
+                                            'c', 384)
                     try:
                         if fullsync:
                             colls = _cfgstore['collective']
@@ -2563,7 +2676,13 @@ class ConfigManager(object):
                 currdict = _cfgstore['main']
                 for category in currdict:
                     _mkpath(pathname)
-                    dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
+                    try:
+                        dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
+                    except dbm.error:
+                        if not fullsync:
+                            raise
+                        os.remove(os.path.join(pathname, category))
+                        dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
                     try:
                         for ck in currdict[category]:
                             dbf[ck] = cPickle.dumps(currdict[category][ck], protocol=cPickle.HIGHEST_PROTOCOL)
@@ -2583,7 +2702,13 @@ class ConfigManager(object):
                         currdict = _cfgstore['tenant'][tenant]
                     for category in dkdict:
                         _mkpath(pathname)
-                        dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
+                        try:
+                            dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
+                        except dbm.error:
+                            if not fullsync:
+                                raise
+                            os.remove(os.path.join(pathname, category))
+                            dbf = dbm.open(os.path.join(pathname, category), 'c', 384)  # 0600
                         try:
                             for ck in dkdict[category]:
                                 if ck not in currdict[category]:
@@ -2721,8 +2846,8 @@ def dump_db_to_directory(location, password, redact=None, skipkeys=False):
             cfgfile.write('\n')
     bkupglobals = get_globals()
     if bkupglobals:
-        json.dump(bkupglobals, open(os.path.join(location, 'globals.json'),
-                                    'w'))
+        with open(os.path.join(location, 'globals.json'), 'w') as globout:
+            json.dump(bkupglobals, globout)
     try:
         for tenant in os.listdir(
                 os.path.join(ConfigManager._cfgdir, '/tenants/')):

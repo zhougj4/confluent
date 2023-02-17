@@ -37,7 +37,7 @@ alias nodereseat='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export C
 alias noderun='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; noderun'
 alias nodesensors='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; nodesensors'
 alias nodesetboot='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; nodesetboot'
-alias nodestorage='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; nodestorage'
+alias nodestorage='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; nodestorage -i'
 alias nodeshell='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; nodeshell'
 alias nodelicense='CURRENT_CMDLINE=$(HISTTIMEFORMAT= builtin history 1); export CURRENT_CMDLINE; nodelicense'
 # Do not continue for non-bash shells, the rest of this sets up bash completion functions
@@ -79,6 +79,17 @@ function _confluent_generic_completion()
     fi
     if [ $NUMARGS -lt 3 ]; then
         _confluent_nr_completion
+        return;
+    fi
+}
+function _confluent_generic_ng_completion()
+{
+    _confluent_get_args
+    if [ $NUMARGS -ge 3 ] && [ ! -z "$GENNED" ]; then
+        COMPREPLY=($(compgen -W "$GENNED" -- ${COMP_WORDS[COMP_CWORD]}))
+    fi
+    if [ $NUMARGS -lt 3 ]; then
+        _confluent_ng_completion
         return;
     fi
 }
@@ -142,7 +153,7 @@ _confluent_osimage_completion()
 {
     _confluent_get_args
     if [ $NUMARGS == 2 ]; then
-        COMPREPLY=($(compgen -W "initialize import updateboot" -- ${COMP_WORDS[COMP_CWORD]}))
+        COMPREPLY=($(compgen -W "initialize import updateboot rebase" -- ${COMP_WORDS[COMP_CWORD]}))
         return
     elif [ ${CMPARGS[1]} == 'initialize' ]; then
         COMPREPLY=($(compgen -W "-h -u -s -t -i" -- ${COMP_WORDS[COMP_CWORD]}))
@@ -150,7 +161,7 @@ _confluent_osimage_completion()
         compopt -o default
         COMPREPLY=()
         return
-    elif [ ${CMPARGS[1]} == 'updateboot' ]; then
+    elif [ ${CMPARGS[1]} == 'updateboot' -o ${CMPARGS[1]} == 'rebase' ]; then
         COMPREPLY=($(compgen -W "-n $(confetty show /deployment/profiles|sed -e 's/\///')" -- "${COMP_WORDS[COMP_CWORD]}"))
         return
     fi
@@ -160,18 +171,33 @@ _confluent_imgutil_completion()
 {
     _confluent_get_args
     if [ $NUMARGS == 2 ]; then
-        COMPREPLY=($(compgen -W "build exec pack" -- ${COMP_WORDS[COMP_CWORD]}))
+        COMPREPLY=($(compgen -W "build exec unpack pack capture" -- ${COMP_WORDS[COMP_CWORD]}))
         return
     elif [ ${CMPARGS[1]} == 'build' ]; then
         COMPREPLY=($(compgen -W "-s $(ls /var/lib/confluent/distributions)" -- ${COMP_WORDS[COMP_CWORD]}))
-	return
-    elif [ ${CMPARGS[1]} == 'pack' ]; then
+	    return
+    elif [ ${CMPARGS[1]} == 'unpack' ]; then
+        if [ $NUMARGS == 3 ]; then
+            COMPREPLY=($(compgen -W "-s $(ls /var/lib/confluent/public/os)" -- ${COMP_WORDS[COMP_CWORD]}))
+            return
+        fi
         compopt -o dirnames
+	    return
+    elif [ ${CMPARGS[1]} == 'pack' ]; then
+        if [ $NUMARGS == 3 ]; then
+            compopt -o dirnames
+        fi
         COMPREPLY=()
+        return
+    elif [ ${CMPARGS[1]} == 'capture' ]; then
+        if [ $NUMARGS == 3 ]; then
+            _confluent_nn_completion
+            return
+        fi
         return
     elif [ ${CMPARGS[1]} == 'exec' ]; then
         compopt -o dirnames
-	COMPREPLY=($(compgen -W "-v" -- ${COMP_WORDS[COMP_CWORD]}))
+	    COMPREPLY=($(compgen -W "-v" -- ${COMP_WORDS[COMP_CWORD]}))
         return
     fi
 }
@@ -253,13 +279,23 @@ _confluent_nodeattrib_completion()
     _confluent_generic_completion
 }
 
+_confluent_define_completion()
+{
+    COMP_CANDIDATES=$(nodegroupattrib 'everything' all | awk '{print $2}'|sed -e 's/://')
+    _confluent_get_args
+    if [ $NUMARGS -ge 3 ] && [ ! -z "$GENNED" ]; then
+        COMPREPLY=($(compgen -W "$GENNED" -- ${COMP_WORDS[COMP_CWORD]}))
+    fi
+}
 
+_confluent_nodegroupattrib_completion()
+{
+    COMP_CANDIDATES=$(nodegroupattrib 'everything' all | awk '{print $2}'|sed -e 's/://')
+    _confluent_generic_ng_completion
+}
 _confluent_nn_completion()
 {
     _confluent_get_args
-    if [ $NUMARGS -gt 2 ]; then
-        return;
-    fi
     INPUT=${COMP_WORDS[COMP_CWORD]}
     INPUT=${INPUT##*,-}
     INPUT=${INPUT##*,}
@@ -311,18 +347,30 @@ _confluent_ng_completion()
 
     COMPREPLY=($(compgen -W "$(confetty show /nodegroups|sed -e 's/\///' -e s/^/$PREFIX/)" -- "${COMP_WORDS[COMP_CWORD]}"))
 }
+
+_confluent_nodediscover_completion()
+{
+        _confluent_get_args
+        if [ $NUMARGS == 2 ]; then
+            COMPREPLY=($(compgen -W "list assign rescan clear subscribe unsubscribe register" -- ${COMP_WORDS[COMP_CWORD]}))
+            return;
+        fi
+
+}
+complete -F _confluent_nodediscover_completion nodediscover
 complete -F _confluent_nodeattrib_completion nodeattrib
-complete -F _confluent_nodeattrib_completion nodegroupattrib
 complete -F _confluent_nr_completion nodebmcreset
 complete -F _confluent_nodesetboot_completion nodeboot
 complete -F _confluent_nr_completion nodeconfig
 complete -F _confluent_nn_completion nodeconsole
+complete -F _confluent_define_completion nodedefine
+complete -F _confluent_define_completion nodegroupdefine
 complete -F _confluent_nr_completion nodeeventlog
 complete -F _confluent_nodefirmware_completion nodefirmware
 complete -F _confluent_nodedeploy_completion nodedeploy
 complete -F _confluent_osimage_completion osdeploy
 complete -F _confluent_imgutil_completion imgutil
-complete -F _confluent_ng_completion nodegroupattrib
+complete -F _confluent_nodegroupattrib_completion nodegroupattrib
 complete -F _confluent_ng_completion nodegroupremove
 complete -F _confluent_nr_completion nodehealth
 complete -F _confluent_nodeidentify_completion nodeidentify

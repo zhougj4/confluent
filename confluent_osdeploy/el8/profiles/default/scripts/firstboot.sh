@@ -7,19 +7,41 @@
 
 nodename=$(grep ^NODENAME /etc/confluent/confluent.info|awk '{print $2}')
 confluent_apikey=$(cat /etc/confluent/confluent.apikey)
-confluent_mgr=$(grep deploy_server /etc/confluent/confluent.deploycfg|awk '{print $2}')
+v4cfg=$(grep ^ipv4_method: /etc/confluent/confluent.deploycfg)
+v4cfg=${v4cfg#ipv4_method: }
+if [ "$v4cfg" = "static" ] || [ "$v4cfg" = "dhcp" ]; then
+    confluent_mgr=$(grep ^deploy_server: /etc/confluent/confluent.deploycfg)
+    confluent_mgr=${confluent_mgr#deploy_server: }
+    confluent_pingtarget=$confluent_mgr
+fi
+if [ -z "$confluent_mgr" ]; then
+    confluent_mgr=$(grep ^deploy_server_v6: /etc/confluent/confluent.deploycfg)
+    confluent_mgr=${confluent_mgr#deploy_server_v6: }
+    if [ -z "$confluent_mgr" ]; then
+        confluent_mgr=$(grep ^deploy_server: /etc/confluent/confluent.deploycfg)
+        confluent_mgr=${confluent_mgr#deploy_server: }
+        confluent_pingtarget=$confluent_mgr
+    else
+        confluent_pingtarget=$confluent_mgr
+        confluent_mgr="[$confluent_mgr]"
+    fi
+fi
 confluent_profile=$(grep ^profile: /etc/confluent/confluent.deploycfg|awk '{print $2}')
 export nodename confluent_mgr confluent_profile
 . /etc/confluent/functions
+(
 exec >> /var/log/confluent/confluent-firstboot.log
 exec 2>> /var/log/confluent/confluent-firstboot.log
-tail -f /var/log/confluent/confluent-firstboot.log > /dev/console &
-logshowpid=$!
+chmod 600 /var/log/confluent/confluent-firstboot.log
+while ! ping -c 1 $confluent_pingtarget >& /dev/null; do
+	sleep 1
+done
 
 if [ ! -f /etc/confluent/firstboot.ran ]; then
     touch /etc/confluent/firstboot.ran
 
     cat /etc/confluent/tls/*.pem >> /etc/pki/tls/certs/ca-bundle.crt
+    run_remote_python confignet
 
     run_remote firstboot.custom
     # Firstboot scripts may be placed into firstboot.d, e.g. firstboot.d/01-firstaction.sh, firstboot.d/02-secondaction.sh
@@ -33,4 +55,5 @@ curl -X POST -d 'status: complete' -H "CONFLUENT_NODENAME: $nodename" -H "CONFLU
 systemctl disable firstboot
 rm /etc/systemd/system/firstboot.service
 rm /etc/confluent/firstboot.ran
-kill $logshowpid
+) &
+tail --pid $! -n 0 -F /var/log/confluent/confluent-firstboot.log > /dev/console

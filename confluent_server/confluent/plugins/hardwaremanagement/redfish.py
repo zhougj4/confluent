@@ -183,7 +183,7 @@ class IpmiCommandWrapper(ipmicommand.Command):
             if 'Access Denied' in str(pe):
                 raise exc.TargetEndpointBadCredentials()
             if 'Redfish not ready' in str(pe):
-                raise exc.TargetEndpointUnreachable('Redfish not yet ready')
+                raise exc.TargetEndpointUnreachable('Redfish is not supported by this system or is not yet ready')
             raise
 
     def close_confluent(self):
@@ -236,6 +236,7 @@ def get_conn_params(node, configdata):
         bmc = configdata['hardwaremanagement.manager']['value']
     else:
         bmc = node
+    bmc = bmc.split('/', 1)[0]
     # TODO(jbjohnso): check if the end has some number after a : without []
     # for non default port
     return {
@@ -509,6 +510,8 @@ class IpmiHandler(object):
             return self.handle_hostname()
         elif self.element[1:3] == ['management_controller', 'domain_name']:
             return self.handle_domain_name()
+        elif self.element[1:3] == ['management_controller', 'location']:
+            return self.handle_location_config()
         elif self.element[1:3] == ['management_controller', 'ntp']:
             return self.handle_ntp()
         elif self.element[1:4] == ['management_controller', 'extended', 'all']:
@@ -586,11 +589,14 @@ class IpmiHandler(object):
         elif len(self.element) == 4 and self.element[-1] == 'management':
             if self.op == 'read':
                 lancfg = self.ipmicmd.get_net_configuration()
+                v6cfg = self.ipmicmd.get_net6_configuration()
                 self.output.put(msg.NetworkConfiguration(
                     self.node, ipv4addr=lancfg['ipv4_address'],
                     ipv4gateway=lancfg['ipv4_gateway'],
                     ipv4cfgmethod=lancfg['ipv4_configuration'],
-                    hwaddr=lancfg['mac_address']
+                    hwaddr=lancfg['mac_address'],
+                    staticv6addrs=v6cfg['static_addrs'],
+                    staticv6gateway=v6cfg['static_gateway']
                 ))
             elif self.op == 'update':
                 config = self.inputdata.netconfig(self.node)
@@ -599,6 +605,11 @@ class IpmiHandler(object):
                         ipv4_address=config['ipv4_address'],
                         ipv4_configuration=config['ipv4_configuration'],
                         ipv4_gateway=config['ipv4_gateway'])
+                    v6addrs = config.get('static_v6_addresses', None)
+                    if v6addrs is not None:
+                        v6addrs = v6addrs.split(',')
+                    v6gw = config.get('static_v6_gateway', None)
+                    self.ipmicmd.set_net6_configuration(static_addresses=v6addrs, static_gateway=v6gw)
                 except socket.error as se:
                     self.output.put(msg.ConfluentNodeError(self.node,
                                                            se.message))
@@ -1276,6 +1287,10 @@ class IpmiHandler(object):
             self.ipmicmd.set_domain_name(dn)
             return
 
+    def handle_location_config(self):
+        if 'read' == self.op:
+            lc = self.ipmicmd.get_location_information()
+
     def handle_bmcconfig(self, advanced=False):
         if 'read' == self.op:
             try:
@@ -1362,11 +1377,12 @@ class IpmiHandler(object):
                 'directory {0}, check ownership and permissions'.format(
                     directory))
         for saved in self.ipmicmd.save_licenses(directory):
-            try:
-                pwent = pwd.getpwnam(self.current_user)
-                os.chown(saved, pwent.pw_uid, pwent.pw_gid)
-            except KeyError:
-                pass
+            if self.current_user:
+                try:
+                    pwent = pwd.getpwnam(self.current_user)
+                    os.chown(saved, pwent.pw_uid, pwent.pw_gid)
+                except KeyError:
+                    pass
             self.output.put(msg.SavedFile(self.node, saved))
 
     def handle_licenses(self):

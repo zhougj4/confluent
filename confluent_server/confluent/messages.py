@@ -185,6 +185,8 @@ class ConfluentMessage(object):
             if (isinstance(val, bool) or isinstance(val, bytes) or
                     isinstance(val, unicode)):
                 value = str(val)
+            elif isinstance(val, int):
+                value = '{0}'.format(int)
             elif val is not None and 'value' in val:
                 value = val['value']
                 if 'inheritedfrom' in val:
@@ -307,6 +309,29 @@ class DeletedResource(ConfluentMessage):
         pass
 
 
+class ConfluentResourceNotFound(ConfluentMessage):
+    notnode = True
+    apicode = 404
+
+    def __init__(self, resource):
+        self.myargs = [resource]
+        self.desc = 'Not Found'
+        self.kvpairs = {'missing': resource}
+
+    def strip_node(self, node):
+        pass
+
+class ConfluentResourceCount(ConfluentMessage):
+    notnode = True
+
+    def __init__(self, count):
+        self.myargs = [count]
+        self.desc = 'Resource Count'
+        self.kvpairs = {'count': count}
+    
+    def strip_node(self, node):
+        pass
+    
 class CreatedResource(ConfluentMessage):
     notnode = True
     readonly = True
@@ -513,6 +538,8 @@ def get_input_message(path, operation, inputdata, nodes=None, multinode=False,
         return InputVolumes(path, nodes, inputdata)
     elif 'inventory/firmware/updates/active' in '/'.join(path) and inputdata:
         return InputFirmwareUpdate(path, nodes, inputdata, configmanager)
+    elif ('/'.join(path).startswith('power/inlets/') or '/'.join(path).startswith('power/outlets/')) and inputdata:
+        return InputPowerMessage(path, nodes, inputdata)
     elif '/'.join(path).startswith('media/detach'):
         return DetachMedia(path, nodes, inputdata)
     elif '/'.join(path).startswith('media/') and inputdata:
@@ -524,6 +551,8 @@ def get_input_message(path, operation, inputdata, nodes=None, multinode=False,
     elif '/'.join(path).startswith(
             'configuration/management_controller/licenses') and inputdata:
         return InputLicense(path, nodes, inputdata, configmanager)
+    elif path == ['deployment', 'ident_image']:
+        return InputIdentImage(path, nodes, inputdata)
     elif inputdata:
         raise exc.InvalidArgumentException(
             'No known input handler for request')
@@ -816,8 +845,9 @@ class InputCredential(ConfluentMessage):
             inputdata['uid'] = int(inputdata['uid'])
         if ('privilege_level' in inputdata and
               inputdata['privilege_level'] not in self.valid_privilege_levels):
-            raise exc.InvalidArgumentException('privilege_level is not one of '
-                                        + ','.join(self.valid_privilege_levels))
+            if not inputdata['privilege_level'].startswith('custom.'):
+                raise exc.InvalidArgumentException('privilege_level is not one of '
+                                            + ','.join(self.valid_privilege_levels))
         if ('enabled' in inputdata and
             inputdata['enabled'] not in self.valid_enabled_values):
             raise exc.InvalidArgumentException('valid values for enabled are '
@@ -884,6 +914,12 @@ class ConfluentInputMessage(ConfluentMessage):
 
     def is_valid_key(self, key):
         return key in self.valid_values
+
+
+class InputIdentImage(ConfluentInputMessage):
+    keyname = 'ident_image'
+    valid_values = ['create']
+
 
 class InputIdentifyMessage(ConfluentInputMessage):
     valid_values = set([
@@ -1471,18 +1507,18 @@ class InputAlertDestination(ConfluentMessage):
                             self.valid_alert_params[key](inputdata[node][key])
             else:
                 return
-            for key in inputdata:
-                if key not in self.valid_alert_params:
-                    raise exc.InvalidArgumentException(
-                            'Unrecognized alert parameter ' + key)
-                if isinstance(inputdata[key], dict):
-                    inputdata[key] = self.valid_alert_params[key](
-                        inputdata[key]['value'])
-                else:
-                    inputdata[key] = self.valid_alert_params[key](
-                        inputdata[key])
-            for node in nodes:
-                self.alertcfg[node] = inputdata
+        for key in inputdata:
+            if key not in self.valid_alert_params:
+                raise exc.InvalidArgumentException(
+                        'Unrecognized alert parameter ' + key)
+            if isinstance(inputdata[key], dict):
+                inputdata[key] = self.valid_alert_params[key](
+                    inputdata[key]['value'])
+            else:
+                inputdata[key] = self.valid_alert_params[key](
+                    inputdata[key])
+        for node in nodes:
+            self.alertcfg[node] = inputdata
 
     def alert_params_by_node(self, node):
         return self.alertcfg[node]
@@ -1588,6 +1624,7 @@ class Disk(ConfluentMessage):
         'hotspare',
         'rebuilding',
         'online',
+        'offline',
     ])
     state_aliases = {
         'unconfigured bad': 'fault',
@@ -1645,16 +1682,19 @@ class NetworkConfiguration(ConfluentMessage):
     desc = 'Network configuration'
 
     def __init__(self, name=None, ipv4addr=None, ipv4gateway=None,
-                 ipv4cfgmethod=None, hwaddr=None):
+                 ipv4cfgmethod=None, hwaddr=None, staticv6addrs=(), staticv6gateway=None):
         self.myargs = (name, ipv4addr, ipv4gateway, ipv4cfgmethod, hwaddr)
         self.notnode = name is None
         self.stripped = False
+        v6addrs = ','.join(staticv6addrs)
 
         kvpairs = {
             'ipv4_address': {'value': ipv4addr},
             'ipv4_gateway': {'value': ipv4gateway},
             'ipv4_configuration': {'value': ipv4cfgmethod},
             'hw_addr': {'value': hwaddr},
+            'static_v6_addresses': {'value': v6addrs},
+            'static_v6_gateway': {'value': staticv6gateway}
         }
         if self.notnode:
             self.kvpairs = kvpairs

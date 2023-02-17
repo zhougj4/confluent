@@ -42,9 +42,9 @@ _attraliases = {
 }
 
 try:
-    input = raw_input
+    getinput = raw_input
 except NameError:
-    pass
+    getinput = input
 
 
 class NestedDict(dict):
@@ -208,7 +208,7 @@ class Command(object):
     def add_precede_dict(self, dict):
         self._prevdict = dict
 
-    def handle_results(self, ikey, rc, res, errnodes=None):
+    def handle_results(self, ikey, rc, res, errnodes=None, outhandler=None):
         if 'error' in res:
             if errnodes is not None:
                 errnodes.add(self._currnoderange)
@@ -245,10 +245,12 @@ class Command(object):
                         node, val, self._prevdict[node]))
                 else:
                     cprint('{0}: {1}'.format(node, val))
+            elif outhandler:
+                outhandler(node, res)
         return rc
 
     def simple_noderange_command(self, noderange, resource, input=None,
-                                 key=None, errnodes=None, promptover=None, **kwargs):
+                                 key=None, errnodes=None, promptover=None, outhandler=None, **kwargs):
         try:
             self._currnoderange = noderange
             rc = 0
@@ -262,13 +264,13 @@ class Command(object):
             if input is None:
                 for res in self.read('/noderange/{0}/{1}'.format(
                         noderange, resource)):
-                    rc = self.handle_results(ikey, rc, res, errnodes)
+                    rc = self.handle_results(ikey, rc, res, errnodes, outhandler)
             else:
                 self.stop_if_noderange_over(noderange, promptover)
                 kwargs[ikey] = input
                 for res in self.update('/noderange/{0}/{1}'.format(
                         noderange, resource), kwargs):
-                    rc = self.handle_results(ikey, rc, res, errnodes)
+                    rc = self.handle_results(ikey, rc, res, errnodes, outhandler)
             self._currnoderange = None
             return rc
         except KeyboardInterrupt:
@@ -284,9 +286,9 @@ class Command(object):
                 nodename = list(self.read(
                     '/noderange/{0}/nodes/'.format(noderange)))[0].get('item', {}).get('href', None)
                 nodename = nodename[:-1]
-                p = input('Command is about to affect node {0}, continue (y/n)? '.format(nodename))
+                p = getinput('Command is about to affect node {0}, continue (y/n)? '.format(nodename))
             else:
-                p = input('Command is about to affect {0} nodes, continue (y/n)? '.format(nsize))
+                p = getinput('Command is about to affect {0} nodes, continue (y/n)? '.format(nsize))
             if p.lower() != 'y':
                 sys.stderr.write('Aborting at user request\n')
                 sys.exit(1)
@@ -401,7 +403,7 @@ class Command(object):
                 if fingerprint == khf[hostid]:
                     return
                 else:
-                    replace = input(
+                    replace = getinput(
                         "MISMATCHED CERTIFICATE DATA, ACCEPT NEW? (y/n):")
                     if replace not in ('y', 'Y'):
                         raise Exception("BAD CERTIFICATE")
@@ -633,7 +635,7 @@ def printgroupattributes(session, requestargs, showtype, nodetype, noderange, op
                         attrout = '{0}: {1}: ********'.format(noderange, attr)
                     else:
                         attrout = '{0}: {1}:'.format(noderange, attr)
-                elif isinstance(currattr, dict) 'broken' in currattr:
+                elif isinstance(currattr, dict) and 'broken' in currattr:
                     attrout = '{0}: {1}: *ERROR* BROKEN EXPRESSION: ' \
                               '{2}'.format(noderange, attr,
                                            currattr['broken'])

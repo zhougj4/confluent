@@ -71,7 +71,7 @@ def connect_to_leader(cert=None, name=None, leader=None, remote=None):
              'subsystem': 'collective'})
     try:
         remote = connect_to_collective(cert, leader, remote)
-    except socket.error as e:
+    except Exception as e:
         log.log({'error': 'Collective connection attempt to {0} failed: {1}'
                           ''.format(leader, str(e)),
                  'subsystem': 'collective'})
@@ -127,7 +127,6 @@ def connect_to_leader(cert=None, name=None, leader=None, remote=None):
             log.log({'info': 'Following leader {0}'.format(leader),
                      'subsystem': 'collective'})
             colldata = tlvdata.recv(remote)
-            # the protocol transmits global data, but for now we ignore it
             globaldata = tlvdata.recv(remote)
             dbi = tlvdata.recv(remote)
             dbsize = dbi['dbsize']
@@ -148,8 +147,8 @@ def connect_to_leader(cert=None, name=None, leader=None, remote=None):
                     cfm._true_add_collective_member(c, colldata[c]['address'],
                                                     colldata[c]['fingerprint'],
                                                     sync=False)
-                #for globvar in globaldata:
-                #    cfm.set_global(globvar, globaldata[globvar], False)
+                for globvar in globaldata:
+                    cfm.set_global(globvar, globaldata[globvar], False)
                 cfm._txcount = dbi.get('txcount', 0)
                 cfm.ConfigManager(tenant=None)._load_from_json(dbjson,
                                                                sync=False)
@@ -184,8 +183,12 @@ def follow_leader(remote, leader):
         if newleader:
             log.log(
                 {'info': 'Previous leader directed us to join new leader {}'.format(newleader)})
-            if connect_to_leader(None, get_myname(), newleader):
-                return
+            try:
+                if connect_to_leader(None, get_myname(), newleader):
+                    return
+            except Exception:
+                log.log({'error': 'Unknown error attempting to connect to {}, check trace log'.format(newleader), 'subsystem': 'collective'})
+                cfm.logException()
         log.log({'info': 'Current leader ({0}) has disappeared, restarting '
                          'collective membership'.format(leader), 'subsystem': 'collective'})
         # The leader has folded, time to startup again...
@@ -234,7 +237,7 @@ def get_myname():
             mycachedname[1] = time.time()
             return mycachedname[0]
     except IOError:
-        myname = socket.gethostname()
+        myname = socket.gethostname().split('.')[0]
         with open('/etc/confluent/cfg/myname', 'w') as f:
             f.write(myname)
         mycachedname[0] = myname
@@ -244,6 +247,7 @@ def get_myname():
 def handle_connection(connection, cert, request, local=False):
     global currentleader
     global retrythread
+    global initting
     connection.settimeout(5)
     operation = request['operation']
     if cert:
@@ -395,6 +399,11 @@ def handle_connection(connection, cert, request, local=False):
             tlvdata.send(connection, {'error': 'Invalid token'})
             connection.close()
             return
+        if not list(cfm.list_collective()):
+            # First enrollment of a collective, since the collective doesn't
+            # quite exist, then set initting false to let the enrollment action
+            # drive this particular initialization
+            initting = False
         myrsp = base64.b64encode(myrsp)
         fprint = util.get_fingerprint(cert)
         myfprint = util.get_fingerprint(mycert)
@@ -472,10 +481,10 @@ def handle_connection(connection, cert, request, local=False):
             return
         log.log({'info': 'Connecting in response to assimilation',
                  'subsystem': 'collective'})
-        if cfm.cfgstreams:
-            retire_as_leader(connection.getpeername())
-        tlvdata.send(connection, {'status': 0})
         newleader = connection.getpeername()[0]
+        if cfm.cfgstreams:
+            retire_as_leader(newleader)
+        tlvdata.send(connection, {'status': 0})
         connection.close()
         if not connect_to_leader(None, None, leader=newleader):
             if retrythread is None:
@@ -540,7 +549,7 @@ def handle_connection(connection, cert, request, local=False):
                                           connection.getpeername()[0])
             tlvdata.send(connection, cfm._dump_keys(None, False))
             tlvdata.send(connection, cfm._cfgstore['collective'])
-            tlvdata.send(connection, {}) # cfm.get_globals())
+            tlvdata.send(connection, {'confluent_uuid': cfm.get_global('confluent_uuid')}) # cfm.get_globals())
             cfgdata = cfm.ConfigManager(None)._dump_to_json()
             tlvdata.send(connection, {'txcount': cfm._txcount,
                                       'dbsize': len(cfgdata)})

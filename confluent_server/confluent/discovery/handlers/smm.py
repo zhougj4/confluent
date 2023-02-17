@@ -36,7 +36,9 @@ def fromstring(inputdata):
         cmpstr = '!entity'
     if cmpstr in inputdata.lower():
         raise Exception('!ENTITY not supported in this interface')
-    return rfromstring(inputdata)
+    # The measures above should filter out the risky facets of xml
+    # We don't need sophisticated feature support
+    return rfromstring(inputdata)  # nosec
 
 def fixuuid(baduuid):
     # SMM dumps it out in hex
@@ -102,6 +104,8 @@ class NodeHandler(bmchandler.NodeHandler):
         cd = cfg.get_node_attributes(
             nodename, ['hardwaremanagement.manager'])
         smmip = cd.get(nodename, {}).get('hardwaremanagement.manager', {}).get('value', None)
+        if smmip:
+            smmip = smmip.split('/', 1)[0]
         if smmip and ':' not in smmip:
             smmip = getaddrinfo(smmip, 0)[0]
             smmip = smmip[-1][0]
@@ -133,7 +137,8 @@ class NodeHandler(bmchandler.NodeHandler):
                     {nodename: {'hardwaremanagement.manager': self.ipaddr}})
 
     def _webconfigcreds(self, username, password):
-        wc = webclient.SecureHTTPConnection(self.ipaddr, 443, verifycallback=self._validate_cert)
+        ip, port = self.get_web_port_and_ip()
+        wc = webclient.SecureHTTPConnection(ip, port, verifycallback=self._validate_cert)
         wc.connect()
         authdata = {  # start by trying factory defaults
             'user': 'USERID',
@@ -151,7 +156,28 @@ class NodeHandler(bmchandler.NodeHandler):
             rsp = wc.getresponse()
             rspdata = util.stringify(rsp.read())
             if 'renew_account' in rspdata:
-                raise Exception('Configured password has expired')
+                tmppassword = 'Tmp42' + password[5:]
+                tokens = fromstring(rspdata)
+                st2 = tokens.findall('st2')[0].text
+                wc.set_header('ST2', st2)
+                wc.request('POST', '/data/changepwd', 'oripwd={0}&newpwd={1}'.format(password, tmppassword))
+                rsp = wc.getresponse()
+                rspdata = rsp.read().decode('utf8')
+                bdata = 'user={0}&password={1}'.format(username, tmppassword)
+                wc.request('POST', '/data/login', bdata, headers)
+                rsp = wc.getresponse()
+                rspdata = rsp.read().decode('utf8')
+                tokens = fromstring(rspdata)
+                st2 = tokens.findall('st2')[0].text
+                wc.set_header('ST2', st2)
+                rules = 'set=passwordChangeInterval:0,passwordReuseCheckNum:0'
+                wc.request('POST', '/data', rules)
+                wc.getresponse().read()
+                wc.request('POST', '/data/changepwd', 'oripwd={0}&newpwd={1}'.format(tmppassword, password))
+                wc.getresponse().read()
+                wc.request('POST', '/data/login', urlencode(authdata), headers)
+                rsp = wc.getresponse()
+                rspdata = util.stringify(rsp.read())
             if 'authResult>0' not in rspdata:
                 raise Exception('Unknown username/password on SMM')
             tokens = fromstring(rspdata)
@@ -193,6 +219,17 @@ class NodeHandler(bmchandler.NodeHandler):
 
     def config(self, nodename):
         # SMM for now has to reset to assure configuration applies
+        cd = self.configmanager.get_node_attributes(
+            nodename, ['secret.hardwaremanagementuser',
+                       'secret.hardwaremanagementpassword',
+                       'hardwaremanagement.manager', 'hardwaremanagement.method', 'console.method'],
+                       True)
+        cd = cd.get(nodename, {})
+        targbmc = cd.get('hardwaremanagement.manager', {}).get('value', '')
+        currip = self.ipaddr if self.ipaddr else ''
+        if not currip.startswith('fe80::') and (targbmc.startswith('fe80::') or not targbmc):
+            raise exc.TargetEndpointUnreachable(
+                'hardwaremanagement.manager must be set to desired address (No IPv6 Link Local detected)')
         dpp = self.configmanager.get_node_attributes(
             nodename, 'discovery.passwordrules')
         self.ruleset = dpp.get(nodename, {}).get(

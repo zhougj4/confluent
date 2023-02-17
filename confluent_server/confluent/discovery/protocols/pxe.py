@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2017 Lenovo
+# Copyright 2017-2021 Lenovo
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,8 +25,10 @@
 import confluent.config.configmanager as cfm
 import confluent.collective.manager as collective
 import confluent.noderange as noderange
+import confluent.neighutil as neighutil
 import confluent.log as log
 import confluent.netutil as netutil
+import confluent.util as util
 import ctypes
 import ctypes.util
 import eventlet
@@ -34,13 +36,20 @@ import eventlet.green.socket as socket
 import eventlet.green.select as select
 import netifaces
 import struct
+import time
 import traceback
+import uuid
 
 libc = ctypes.CDLL(ctypes.util.find_library('c'))
 
 iphdr = b'\x45\x00\x00\x00\x00\x00\x00\x00\x40\x11\x00\x00\x00\x00\x00\x00\xff\xff\xff\xff'
 constiphdrsum = b'\x85\x11'
 udphdr = b'\x00\x43\x00\x44\x00\x00\x00\x00'
+ignoremacs = {}
+ignoredisco = {}
+
+mcastv6addr = 'ff02::1:2'
+
 
 def _ipsum(data):
     currsum = 0
@@ -186,6 +195,33 @@ def _decode_ocp_vivso(rq, idx, size):
         idx += rq[idx + 1] + 2
     return '', None, vivso
 
+def v6opts_to_dict(rq):
+    optidx = 0
+    reqdict = {}
+    disco = {'uuid':None, 'arch': None, 'vivso': None}
+    try:
+        while optidx < len(rq):
+            optnum, optlen = struct.unpack('!HH', rq[optidx:optidx+4])
+            reqdict[optnum] = rq[optidx + 4:optidx + 4 + optlen]
+            optidx += optlen + 4
+    except IndexError:
+        pass
+    reqdict['vci'] = None
+    if 16 in reqdict:
+        vco = reqdict[16]
+        iananum, vlen = struct.unpack('!IH', vco[:6])
+        vci = vco[6:vlen + 6]
+        if vci.startswith(b'HTTPClient:Arch') or vci.startswith(b'PXEClient:Arch:'):
+            reqdict['vci'] = vci.decode('utf8')
+    if 1 in reqdict:
+        duid = reqdict[1]
+        if struct.unpack('!H', duid[:2])[0] == 4:
+            disco['uuid'] = decode_uuid(duid[2:])
+    if 61 in reqdict:
+        arch = bytes(rq[optidx+4:optidx+4+optlen])
+        disco['arch'] = pxearchs.get(bytes(reqdict[61]), None)
+    return reqdict, disco
+
 def opts_to_dict(rq, optidx, expectype=1):
     reqdict = {}
     disco = {'uuid':None, 'arch': None, 'vivso': None}
@@ -204,10 +240,16 @@ def opts_to_dict(rq, optidx, expectype=1):
     maybeztp = False
     if 239 in reqdict.get(55, []):
         maybeztp = True
-    vci = stringify(reqdict.get(60, b''))
+    try:
+        vci = stringify(reqdict.get(60, b''))
+    except UnicodeDecodeError:
+        vci = ''
+    reqdict['vci'] = None
     if vci.startswith('cumulus-linux'):
         disco['arch'] = vci.replace('cumulus-linux', '').strip()
         iscumulus = True
+    elif vci.startswith('HTTPClient:Arch') or vci.startswith('PXEClient'):
+        reqdict['vci'] = vci
     if reqdict.get(93, None):
         disco['arch'] = pxearchs.get(bytes(reqdict[93]), None)
     if reqdict.get(97, None):
@@ -231,25 +273,45 @@ def opts_to_dict(rq, optidx, expectype=1):
 def ipfromint(numb):
     return socket.inet_ntoa(struct.pack('I', numb))
 
-def proxydhcp():
+def proxydhcp(handler, nodeguess):
     net4011 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     net4011.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     net4011.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
     net4011.bind(('', 4011))
+    rp = bytearray(300)
+    rpv = memoryview(rp)
+    rq = bytearray(2048)
+    data = pkttype.from_buffer(rq)
+    msg = msghdr()
+    cmsgarr = bytearray(cmsgsize)
+    cmsg = cmsgtype.from_buffer(cmsgarr)
+    iov = iovec()
+    iov.iov_base = ctypes.addressof(data)
+    iov.iov_len = 2048
+    msg.msg_iov = ctypes.pointer(iov)
+    msg.msg_iovlen = 1
+    msg.msg_control = ctypes.addressof(cmsg)
+    msg.msg_controllen = ctypes.sizeof(cmsg)
+    clientaddr = sockaddr_in()
+    msg.msg_name = ctypes.addressof(clientaddr)
+    msg.msg_namelen = ctypes.sizeof(clientaddr)
     cfg = cfm.ConfigManager(None)
     while True:
         ready = select.select([net4011], [], [], None)
         if not ready or not ready[0]:
             continue
-        rq = bytearray(1024)
-        rqv = memoryview(rq)
-        nb, client = net4011.recvfrom_into(rq)
-        if nb < 240:
+        i = recvmsg(net4011.fileno(), ctypes.pointer(msg), 0)
+        #nb, client = net4011.recvfrom_into(rq)
+        if i < 240:
             continue
-        rp = bytearray(1024)
-        rpv = memoryview(rp)
+        rqv = memoryview(rq)[:i]
+        client = (ipfromint(clientaddr.sin_addr.s_addr), socket.htons(clientaddr.sin_port))
+        _, level, typ = struct.unpack('QII', cmsgarr[:16])
+        if level == socket.IPPROTO_IP and typ == IP_PKTINFO:
+            idx, recv = struct.unpack('II', cmsgarr[16:24])
+            recv = ipfromint(recv)
         try:
-            optidx = rq.index(b'\x63\x82\x53\x63') + 4
+            optidx = rqv.tobytes().index(b'\x63\x82\x53\x63') + 4
         except ValueError:
             continue
         hwlen = rq[2]
@@ -260,15 +322,42 @@ def proxydhcp():
             node = macmap[disco['hwaddr']]
         elif disco.get('uuid', None) in uuidmap:
             node = uuidmap[disco['uuid']]
-        if not node:
-            continue
-
         myipn = myipbypeer.get(rqv[28:28+hwlen].tobytes(), None)
+        skiplogging = True
+        netaddr = disco['hwaddr']
+        if time.time() > ignoredisco.get(netaddr, 0) + 90:
+            skiplogging = False
+            ignoredisco[netaddr] = time.time()
         if not myipn:
+            info = {'hwaddr': netaddr, 'uuid': disco['uuid'],
+                            'architecture': disco['arch'],
+                            'netinfo': {'ifidx': idx, 'recvip': recv},
+                            'services': ('pxe-client',)}
+            if not skiplogging:
+                handler(info)
+        if not node:
+            if not myipn and not skiplogging:
+                log.log(
+                        {'info': 'No node matches boot attempt from uuid {0} or hardware address {1}'.format(
+                            disco.get('uuid', 'unknown'), disco.get('hwaddr', 'unknown')
+                )})
             continue
-        if opts.get(77, None) == b'iPXE':
+        profile = None
+        if not myipn:
+            myipn = socket.inet_aton(recv)
             profile = get_deployment_profile(node, cfg)
+            if profile:
+                log.log({
+                    'info': 'Offering proxyDHCP boot from {0} to {1} ({2})'.format(recv, node, client[0])})
+            else:
+                if not skiplogging:
+                    log.log({'info': 'No pending profile for {0}, skipping proxyDHCP reply'.format(node)})
+                continue
+        if opts.get(77, None) == b'iPXE':
             if not profile:
+                profile = get_deployment_profile(node, cfg)
+            if not profile:
+                log.log({'info': 'No pending profile for {0}, skipping proxyDHCP reply'.format(node)})
                 continue
             myip = socket.inet_ntoa(myipn)
             bootfile = 'http://{0}/confluent-public/os/{1}/boot.ipxe'.format(myip, profile).encode('utf8')
@@ -276,6 +365,8 @@ def proxydhcp():
             bootfile = b'confluent/x86_64/ipxe.efi'
         elif disco['arch'] == 'bios-x86':
             bootfile = b'confluent/x86_64/ipxe.kkpxe'
+        elif disco['arch'] == 'uefi-aarch64':
+            bootfile = b'confluent/aarch64/ipxe.efi'
         if len(bootfile) > 127:
             log.log(
                 {'info': 'Boot offer cannot be made to {0} as the '
@@ -294,15 +385,16 @@ def proxydhcp():
         net4011.sendto(rpv[:281], client)
 
 
-def start_proxydhcp():
-    eventlet.spawn_n(proxydhcp)
+def start_proxydhcp(handler, nodeguess=None):
+    eventlet.spawn_n(proxydhcp, handler, nodeguess)
 
 
-def snoop(handler, protocol=None):
+def snoop(handler, protocol=None, nodeguess=None):
     #TODO(jjohnson2): ipv6 socket and multicast for DHCPv6, should that be
     #prominent
     #TODO(jjohnson2): enable unicast replies. This would suggest either
     # injection into the neigh table before OFFER or using SOCK_RAW.
+    start_proxydhcp(handler, nodeguess)
     tracelog = log.Logger('trace')
     global attribwatcher
     cfg = cfm.ConfigManager(None)
@@ -313,94 +405,137 @@ def snoop(handler, protocol=None):
     net4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     net4.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     net4.setsockopt(socket.IPPROTO_IP, IP_PKTINFO, 1)
-    net4.bind(('', 67))
+    try:
+        net4.bind(('', 67))
+    except Exception:
+        log.log({'error': 'Unable to bind DHCP server port, if using dnsmasq, specify bind-dynamic in dnsmasq.conf and restart dnsmasq and then confluent'})
+        return
+    v6addr = socket.inet_pton(socket.AF_INET6, mcastv6addr)
+    net6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    net6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    for ifidx in util.list_interface_indexes():
+        v6grp = v6addr + struct.pack('=I', ifidx)
+        net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, v6grp)
+    net6.bind(('', 547))
+    clientaddr = sockaddr_in()
+    rawbuffer = bytearray(2048)
+    data = pkttype.from_buffer(rawbuffer)
+    msg = msghdr()
+    cmsgarr = bytearray(cmsgsize)
+    cmsg = cmsgtype.from_buffer(cmsgarr)
+    iov = iovec()
+    iov.iov_base = ctypes.addressof(data)
+    iov.iov_len = 2048
+    msg.msg_iov = ctypes.pointer(iov)
+    msg.msg_iovlen = 1
+    msg.msg_control = ctypes.addressof(cmsg)
+    msg.msg_controllen = ctypes.sizeof(cmsg)
+    msg.msg_name = ctypes.addressof(clientaddr)
+    msg.msg_namelen = ctypes.sizeof(clientaddr)
+    # We'll leave name and namelen blank for now
     while True:
         try:
             # Just need some delay, picked a prime number so that overlap with other
             # timers might be reduced, though it really is probably nothing
-            ready = select.select([net4], [], [], None)
+            ready = select.select([net4, net6], [], [], None)
             if not ready or not ready[0]:
                 continue
-            clientaddr = sockaddr_in()
-            rawbuffer = bytearray(2048)
-            data = pkttype.from_buffer(rawbuffer)
-            msg = msghdr()
-            cmsgarr = bytearray(cmsgsize)
-            cmsg = cmsgtype.from_buffer(cmsgarr)
-            iov = iovec()
-            iov.iov_base = ctypes.addressof(data)
-            iov.iov_len = 2048
-            msg.msg_iov = ctypes.pointer(iov)
-            msg.msg_iovlen = 1
-            msg.msg_control = ctypes.addressof(cmsg)
-            msg.msg_controllen = ctypes.sizeof(cmsg)
-            msg.msg_name = ctypes.addressof(clientaddr)
-            msg.msg_namelen = ctypes.sizeof(clientaddr)
-            # We'll leave name and namelen blank for now
-            i = recvmsg(net4.fileno(), ctypes.pointer(msg), 0)
-            # if we have a small packet, just skip, it can't possible hold enough
-            # data and avoids some downstream IndexErrors that would be messy
-            # with try/except
-            if i < 64:
-                continue
-            #peer = ipfromint(clientaddr.sin_addr.s_addr)
-            # We don't need peer yet, generally it's 0.0.0.0
-            _, level, typ = struct.unpack('QII', cmsgarr[:16])
-            if level == socket.IPPROTO_IP and typ == IP_PKTINFO:
-                idx, recv, targ = struct.unpack('III', cmsgarr[16:28])
-                recv = ipfromint(recv)
-                targ = ipfromint(targ)
-            # peer is the source ip (in dhcpdiscover, 0.0.0.0)
-            # recv is the 'ip' that recevied the packet, regardless of target
-            # targ is the ip in the destination ip of the header.
-            # idx is the ip link number of the receiving nic
-            # For example, a DHCPDISCOVER will probably have:
-            # peer of 0.0.0.0
-            # targ of 255.255.255.255
-            # recv of <actual ip address that could reply>
-            # idx correlated to the nic
-            rqv = memoryview(rawbuffer)
-            rq = bytearray(rqv[:i])
-            if rq[0] == 1:  # Boot request
-                addrlen = rq[2]
-                if addrlen > 16 or addrlen == 0:
-                    continue
-                rawnetaddr = rq[28:28+addrlen]
-                netaddr = ':'.join(['{0:02x}'.format(x) for x in rawnetaddr])
-                optidx = 0
-                try:
-                    optidx = rq.index(b'\x63\x82\x53\x63') + 4
-                except ValueError:
-                    continue
-                txid = rq[4:8] # struct.unpack('!I', rq[4:8])[0]
-                rqinfo, disco = opts_to_dict(rq, optidx)
-                vivso = disco.get('vivso', None)
-                if vivso:
-                    # info['modelnumber'] = info['attributes']['enclosure-machinetype-model'][0]
-                    info = {'hwaddr': netaddr, 'uuid': disco['uuid'],
-                            'architecture': vivso.get('arch', ''),
-                            'services': (vivso['service-type'],),
-                            'netinfo': {'ifidx': idx, 'recvip': recv, 'txid': txid},
-                            'attributes': {'enclosure-machinetype-model': [vivso.get('machine', '')]}}
-                    handler(info)
-                    #consider_discover(info, rqinfo, net4, cfg, rqv)
-                    continue
-                # We will fill out service to have something to byte into,
-                # but the nature of the beast is that we do not have peers,
-                # so that will not be present for a pxe snoop
-                info = {'hwaddr': netaddr, 'uuid': disco['uuid'],
-                        'architecture': disco['arch'],
-                        'netinfo': {'ifidx': idx, 'recvip': recv, 'txid': txid},
-                        'services': ('pxe-client',)}
-                if disco['uuid']:  #TODO(jjohnson2): need to explictly check for
-                                # discover, so that the parser can go ahead and
-                                # parse the options including uuid to enable
-                                # ACK
-                    handler(info)
-                consider_discover(info, rqinfo, net4, cfg, rqv)
+            for netc in ready[0]:
+                idx = None
+                if netc == net4:
+                    i = recvmsg(netc.fileno(), ctypes.pointer(msg), 0)
+                    # if we have a small packet, just skip, it can't possible hold enough
+                    # data and avoids some downstream IndexErrors that would be messy
+                    # with try/except
+                    if i < 64:
+                        continue
+                    _, level, typ = struct.unpack('QII', cmsgarr[:16])
+                    if level == socket.IPPROTO_IP and typ == IP_PKTINFO:
+                        idx, recv = struct.unpack('II', cmsgarr[16:24])
+                        recv = ipfromint(recv)
+                    rqv = memoryview(rawbuffer)[:i]
+                    if rawbuffer[0] == 1:  # Boot request
+                        process_dhcp4req(handler, nodeguess, cfg, net4, idx, recv, rqv)
+                elif netc == net6:
+                    recv = 'ff02::1:2'
+                    pkt, addr = netc.recvfrom(2048)
+                    idx = addr[-1]
+                    i = len(pkt)
+                    if i < 64:
+                        continue
+                    rqv = memoryview(pkt)
+                    rq = bytearray(rqv[:2])
+                    if rq[0] in (1, 3): # dhcpv6 solicit
+                        process_dhcp6req(handler, rqv, addr, netc, cfg, nodeguess)
+
         except Exception as e:
             tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                             event=log.Events.stacktrace)
+
+def process_dhcp6req(handler, rqv, addr, net, cfg, nodeguess):
+    ip = addr[0]
+    req, disco = v6opts_to_dict(bytearray(rqv[4:]))
+    req['txid'] = rqv[1:4]
+    req['rqtype'] = bytearray(rqv[:1])[0]
+    if not disco.get('uuid', None) or not disco.get('arch', None):
+        return
+    if disco['uuid'] == '03000200-0400-0500-0006-000700080009':
+        # Ignore common malformed dhcpv6 request from firmware
+        return
+    mac = neighutil.get_hwaddr(ip.split('%', 1)[0])
+    if not mac:
+        net.sendto(b'\x00', addr)
+    tries = 5
+    while tries and not mac:
+        eventlet.sleep(0.01)
+        tries -= 1
+        mac = neighutil.get_hwaddr(ip.split('%', 1)[0])
+    info = {'hwaddr': mac, 'uuid': disco['uuid'],
+            'architecture': disco['arch'], 'services': ('pxe-client',)}
+    if ignoredisco.get(mac, 0) + 90 < time.time():
+        ignoredisco[mac] = time.time()
+        handler(info)
+    consider_discover(info, req, net, cfg, None, nodeguess, addr)
+
+def process_dhcp4req(handler, nodeguess, cfg, net4, idx, recv, rqv):
+    rq = bytearray(rqv)
+    addrlen = rq[2]
+    if addrlen > 16 or addrlen == 0:
+        return
+    rawnetaddr = rq[28:28+addrlen]
+    netaddr = ':'.join(['{0:02x}'.format(x) for x in rawnetaddr])
+    optidx = 0
+    try:
+        optidx = rq.index(b'\x63\x82\x53\x63') + 4
+    except ValueError:
+        return
+    txid = rq[4:8] # struct.unpack('!I', rq[4:8])[0]
+    rqinfo, disco = opts_to_dict(rq, optidx)
+    vivso = disco.get('vivso', None)
+    if vivso:
+                        # info['modelnumber'] = info['attributes']['enclosure-machinetype-model'][0]
+        info = {'hwaddr': netaddr, 'uuid': disco['uuid'],
+                                'architecture': vivso.get('arch', ''),
+                                'services': (vivso['service-type'],),
+                                'netinfo': {'ifidx': idx, 'recvip': recv, 'txid': txid},
+                                'attributes': {'enclosure-machinetype-model': [vivso.get('machine', '')]}}
+        if time.time() > ignoredisco.get(netaddr, 0) + 90:
+            ignoredisco[netaddr] = time.time()
+            handler(info)
+                        #consider_discover(info, rqinfo, net4, cfg, rqv)
+        return
+                    # We will fill out service to have something to byte into,
+                    # but the nature of the beast is that we do not have peers,
+                    # so that will not be present for a pxe snoop
+    info = {'hwaddr': netaddr, 'uuid': disco['uuid'],
+                            'architecture': disco['arch'],
+                            'netinfo': {'ifidx': idx, 'recvip': recv, 'txid': txid},
+                            'services': ('pxe-client',)}
+    if (disco['uuid']
+                            and time.time() > ignoredisco.get(netaddr, 0) + 90):
+        ignoredisco[netaddr] = time.time()
+        handler(info)
+    consider_discover(info, rqinfo, net4, cfg, rqv, nodeguess)
 
 
 
@@ -419,6 +554,10 @@ def new_nodes(added, deleting, renamed, configmanager):
     configmanager.remove_watcher(attribwatcher)
     alldeleting = set(deleting) | set(renamed)
     clear_nodes(alldeleting)
+    alladding = set(added)
+    for oldname in renamed:
+        alladding.add(renamed[oldname])
+    remap_nodes(alladding, configmanager)
     attribwatcher = configmanager.watch_attributes(configmanager.list_nodes(),
                                                    ('id.uuid', 'net.*hwaddr'), remap_nodes)
 
@@ -438,7 +577,7 @@ def remap_nodes(nodeattribs, configmanager):
 
 def get_deployment_profile(node, cfg, cfd=None):
     if not cfd:
-        cfd = cfg.get_node_attributes(node, ('deployment.*'))
+        cfd = cfg.get_node_attributes(node, ('deployment.*', 'collective.managercandidates'))
     profile = cfd.get(node, {}).get('deployment.pendingprofile', {}).get('value', None)
     if not profile:
         return None
@@ -451,15 +590,112 @@ def get_deployment_profile(node, cfg, cfd=None):
 
 staticassigns = {}
 myipbypeer = {}
-def check_reply(node, info, packet, sock, cfg, reqview):
+def check_reply(node, info, packet, sock, cfg, reqview, addr):
     httpboot = info['architecture'] == 'uefi-httpboot'
-    replen = 275  # default is going to be 286
-    cfd = cfg.get_node_attributes(node, ('deployment.*'))
+    cfd = cfg.get_node_attributes(node, ('deployment.*', 'collective.managercandidates'))
     profile = get_deployment_profile(node, cfg, cfd)
     if not profile:
+        if time.time() > ignoremacs.get(info['hwaddr'], 0) + 90:
+            ignoremacs[info['hwaddr']] = time.time()
+            log.log({'info': 'Ignoring boot attempt by {0} no deployment profile specified (uuid {1}, hwaddr {2})'.format(
+                node, info['uuid'], info['hwaddr']
+            )})
         return
-    myipn = info['netinfo']['recvip']
-    myipn = socket.inet_aton(myipn)
+    if addr:
+        if packet['vci'] and packet['vci'].startswith('PXEClient'):
+            log.log({'info': 'IPv6 PXE boot attempt by {0}, but IPv6 PXE is not supported, try IPv6 HTTP boot or IPv4 boot'.format(node)})
+            return
+        return reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock)
+    else:
+        return reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile)
+
+def reply_dhcp6(node, addr, cfg, packet, cfd, profile, sock):
+    myaddrs = netutil.get_my_addresses(addr[-1], socket.AF_INET6)
+    if not myaddrs:
+        log.log({'info': 'Unable to provide IPv6 boot services to {0}, no viable IPv6 configuration on interface index "{1}" to respond through.'.format(node, addr[-1])})
+        return
+    niccfg = netutil.get_nic_config(cfg, node, ifidx=addr[-1])
+    ipv6addr = niccfg.get('ipv6_address', None)
+    ipv6prefix = niccfg.get('ipv6_prefix', None)
+    ipv6method = niccfg.get('ipv6_method', 'static')
+    ipv6srvaddr = niccfg.get('deploy_server_v6', None)
+    if not ipv6srvaddr:
+        log.log({'info': 'Unable to determine an appropriate ipv6 server ip for {}'.format(node)})
+        return
+    insecuremode = cfd.get(node, {}).get('deployment.useinsecureprotocols',
+        {}).get('value', 'never')
+    if not insecuremode:
+        insecuremode = 'never'
+    proto = 'https' if insecuremode == 'never' else 'http'
+    bootfile = '{0}://[{1}]/confluent-public/os/{2}/boot.img'.format(
+        proto, ipv6srvaddr, profile
+    )
+    if not isinstance(bootfile, bytes):
+        bootfile = bootfile.encode('utf8')
+    ipass = []
+    if ipv6method == 'firmwarenone':
+        return
+    if ipv6method not in ('dhcp', 'firmwaredhcp') and ipv6addr:
+        if not ipv6prefix:
+            log.log({'info': 'Unable to determine prefix to serve to address {} for node {}'.format(ipv6addr, node)})
+            return
+        ipass = bytearray(40)
+        ipass[:4] = packet[3][:4]  # pass iaid back
+        ipass[4:16] = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x18'
+        ipass[16:32] = socket.inet_pton(socket.AF_INET6, ipv6addr)
+        ipass[32:40] = b'\x00\x00\x00\x78\x00\x00\x01\x2c'
+    elif (not packet['vci']) or not packet['vci'].startswith('HTTPClient:Arch:'):
+        return # do not send ip-less replies to anything but HTTPClient specifically
+    #1 msgtype
+    #3 txid
+    #22 - server ident
+    #len(packet[1]) + 4 - client ident
+    #len(ipass) + 4 or 0
+    #len(url) + 4
+    replylen = 50 + len(bootfile) + len(packet[1]) + 4
+    if len(ipass):
+        replylen += len(ipass)
+    reply = bytearray(replylen)
+    reply[0] = 2 if packet['rqtype'] == 1 else 7
+    reply[1:4] = packet['txid']
+    offset = 4
+    struct.pack_into('!HH', reply, offset, 1, len(packet[1]))
+    offset += 4
+    reply[offset:offset+len(packet[1])] = packet[1]
+    offset += len(packet[1])
+    struct.pack_into('!HHH', reply, offset, 2, 18, 4)
+    offset += 6
+    reply[offset:offset+16] = get_my_duid()
+    offset += 16
+    if ipass:
+        struct.pack_into('!HH', reply, offset, 3, len(ipass))
+        offset += 4
+        reply[offset:offset + len(ipass)] = ipass
+        offset += len(ipass)
+    struct.pack_into('!HH', reply, offset, 59, len(bootfile))
+    offset += 4
+    reply[offset:offset + len(bootfile)] = bootfile
+    offset += len(bootfile)
+    # Need the HTTPClient in the vendor class for reply
+    struct.pack_into('!HHIH', reply, offset, 16, 16, 0, 10)
+    offset += 10
+    reply[offset:offset + 10] = b'HTTPClient'
+    sock.sendto(reply, addr)
+
+
+_myuuid = None
+def get_my_duid():
+    global _myuuid
+    if not _myuuid:
+        _myuuid = uuid.uuid4().bytes
+    return _myuuid
+
+
+def reply_dhcp4(node, info, packet, cfg, reqview, httpboot, cfd, profile):
+    replen = 275  # default is going to be 286
+    # while myipn is describing presumed destination, it's really
+    # vague in the face of aliases, need to convert to ifidx and evaluate
+    # aliases for best match to guess
 
     rqtype = packet[53][0]
     insecuremode = cfd.get(node, {}).get('deployment.useinsecureprotocols',
@@ -478,29 +714,13 @@ def check_reply(node, info, packet, sock, cfg, reqview):
     reply = bytearray(512)
     repview = memoryview(reply)
     repview[:20] = iphdr
-    repview[12:16] = myipn
     repview[20:28] = udphdr
+    orepview = repview
     repview = repview[28:]
     repview[0:1] = b'\x02'
     repview[1:10] = reqview[1:10] # duplicate txid, hwlen, and others
     repview[10:11] = b'\x80'  # always set broadcast
     repview[28:44] = reqview[28:44]  # copy chaddr field
-    if httpboot:
-        proto = 'https' if insecuremode == 'never' else 'http'
-        bootfile = '{0}://{1}/confluent-public/os/{2}/boot.img'.format(
-            proto, info['netinfo']['recvip'], profile
-        )
-        if not isinstance(bootfile, bytes):
-            bootfile = bootfile.encode('utf8')
-        if len(bootfile) > 127:
-            log.log(
-                {'info': 'Boot offer cannot be made to {0} as the '
-                'profile name "{1}" is {2} characters longer than is supported '
-                'for this boot method.'.format(
-                    node, profile, len(bootfile) - 127)})
-            return
-        repview[108:108 + len(bootfile)] = bootfile
-    repview[20:24] = myipn
     gateway = None
     netmask = None
     niccfg = netutil.get_nic_config(cfg, node, ifidx=info['netinfo']['ifidx'])
@@ -512,15 +732,45 @@ def check_reply(node, info, packet, sock, cfg, reqview):
         log.log({'error': 'Skipping boot reply to {0} due to no viable IPv4 configuration on deployment system'.format(node)})
         return
     clipn = None
+    if niccfg['ipv4_method'] == 'firmwarenone':
+        return
     if niccfg['ipv4_address'] and niccfg['ipv4_method'] != 'firmwaredhcp':
         clipn = socket.inet_aton(niccfg['ipv4_address'])
         repview[16:20] = clipn
         gateway = niccfg['ipv4_gateway']
+        netmask = niccfg['prefix']
         if gateway:
             gateway = socket.inet_aton(gateway)
-        netmask = niccfg['prefix']
+            if not netutil.ipn_on_same_subnet(socket.AF_INET, clipn, gateway, netmask):
+                log.log(
+                    {'warning': 'Ignoring gateway {0} due to mismatch with address {1}/{2}'.format(niccfg['ipv4_gateway'], niccfg['ipv4_address'], netmask)})
+                gateway = None
         netmask = (2**32 - 1) ^ (2**(32 - netmask) - 1)
         netmask = struct.pack('!I', netmask)
+    elif (not packet['vci']) or not (packet['vci'].startswith('HTTPClient:Arch:') or packet['vci'].startswith('PXEClient')):
+        return  # do not send ip-less replies to anything but netboot specifically
+    myipn = niccfg['deploy_server']
+    if not myipn:
+        myipn = info['netinfo']['recvip']
+    if httpboot:
+        proto = 'https' if insecuremode == 'never' else 'http'
+        bootfile = '{0}://{1}/confluent-public/os/{2}/boot.img'.format(
+            proto, myipn, profile
+        )
+        if not isinstance(bootfile, bytes):
+            bootfile = bootfile.encode('utf8')
+        if len(bootfile) > 127:
+            log.log(
+                {'info': 'Boot offer cannot be made to {0} as the '
+                'profile name "{1}" is {2} characters longer than is supported '
+                'for this boot method.'.format(
+                    node, profile, len(bootfile) - 127)})
+            return
+        repview[108:108 + len(bootfile)] = bootfile
+    myip = myipn
+    myipn = socket.inet_aton(myipn)
+    orepview[12:16] = myipn
+    repview[20:24] = myipn
     repview[236:240] = b'\x63\x82\x53\x63'
     repview[240:242] = b'\x35\x01'
     if rqtype == 1:  # if discover, then offer
@@ -580,7 +830,7 @@ def check_reply(node, info, packet, sock, cfg, reqview):
     if clipn:
         ipinfo = 'with static address {0}'.format(niccfg['ipv4_address'])
     else:
-        ipinfo = 'without address'
+        ipinfo = 'without address, served from {0}'.format(myip)
     log.log({
         'info': 'Offering {0} boot {1} to {2}'.format(boottype, ipinfo, node)})
     send_raw_packet(repview, replen + 28, reqview, info)
@@ -631,13 +881,40 @@ def ack_request(pkt, rq, info):
     repview[26:28] = struct.pack('!H', datasum)
     send_raw_packet(repview, len(rply), rq, info)
 
-def consider_discover(info, packet, sock, cfg, reqview):
+def consider_discover(info, packet, sock, cfg, reqview, nodeguess, addr=None):
     if info.get('hwaddr', None) in macmap and info.get('uuid', None):
-        check_reply(macmap[info['hwaddr']], info, packet, sock, cfg, reqview)
+        check_reply(macmap[info['hwaddr']], info, packet, sock, cfg, reqview, addr)
     elif info.get('uuid', None) in uuidmap:
-        check_reply(uuidmap[info['uuid']], info, packet, sock, cfg, reqview)
+        check_reply(uuidmap[info['uuid']], info, packet, sock, cfg, reqview, addr)
     elif packet.get(53, None) == b'\x03':
         ack_request(packet, reqview, info)
+    elif info.get('uuid', None) and info.get('hwaddr', None):
+        if time.time() > ignoremacs.get(info['hwaddr'], 0) + 90:
+            ignoremacs[info['hwaddr']] = time.time()
+            maybenode = None
+            if nodeguess:
+                maybenode = nodeguess(info['uuid'])
+            if maybenode:
+                # originally was going to just offer up the node (the likely
+                # scenario is that it was manually added, autodiscovery picked
+                # up the TLS match, and correlated)
+                # However, since this is technically unverified data, we shouldn't
+                # act upon it until confirmed by process or user
+                # So instead, offer a hint about what is probably the case, but
+                # hasn't yet been approved by anything
+                log.log(
+                        {'info': 'Boot attempt from uuid {0} or hardware '
+                                 'address {1}, which is not confirmed to be a '
+                                 'node, but seems to be {2}. To confirm node '
+                                 'identity, \'nodediscover reassign -n {2}\' or '
+                                 '\'nodeattrib {2} id.uuid={0}\''.format(
+                            info['uuid'], info['hwaddr'], maybenode
+                )})
+            else:
+                log.log(
+                        {'info': 'No node matches boot attempt from uuid {0} or hardware address {1}'.format(
+                            info['uuid'], info['hwaddr']
+                )})
 
 
 if __name__ == '__main__':

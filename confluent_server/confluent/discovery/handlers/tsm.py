@@ -50,7 +50,7 @@ class NodeHandler(generic.NodeHandler):
         i = c.grab_json_response('/redfish/v1/')
         uuid = i.get('UUID', None)
         if uuid:
-            self.info['uuid'] = uuid
+            self.info['uuid'] = uuid.lower()
 
     def validate_cert(self, certificate):
         # broadly speaking, merely checks consistency moment to moment,
@@ -79,14 +79,14 @@ class NodeHandler(generic.NodeHandler):
                 self.trieddefault = True
                 if '555' in rsp:
                     passchange = {
-                        'Password': self.targpass, 
+                        'Password': self.targpass,
                         'RetypePassword': self.targpass,
                         'param': 4,
                         'default_password': self.DEFAULT_PASS,
                         'username': self.DEFAULT_USER
                         }
                     if authmode == 2:
-                        passchange = {
+                        rpasschange = {
                             'Password': self.targpass,
                         }
                         rwc =  webclient.SecureHTTPConnection(
@@ -98,12 +98,15 @@ class NodeHandler(generic.NodeHandler):
                         rwc.set_header('Content-Type', 'application/json')
                         rsp, status = rwc.grab_json_response_with_status(
                             '/redfish/v1/AccountService/Accounts/1',
-                            passchange, method='PATCH')
+                            rpasschange, method='PATCH')
                         if status >= 200 and status < 300:
                             authdata['password'] = self.targpass
                             eventlet.sleep(10)
                         else:
-                            raise Exception("Redfish may not have been ready yet")
+                            if b'[web.lua] Error in RequestHandler, thread' in rsp:
+                                rsp, status = wc.grab_json_response_with_status('/api/reset-pass', passchange)
+                            else:
+                                raise Exception("Redfish may not have been ready yet" + repr(rsp))
                     else:
                         rsp, status = wc.grab_json_response_with_status('/api/reset-pass', urlencode(passchange))
                     authdata['password'] = self.targpass
@@ -198,6 +201,7 @@ class NodeHandler(generic.NodeHandler):
                 not cd['hardwaremanagement.manager']['value'].startswith(
                     'fe80::')):
             newip = cd['hardwaremanagement.manager']['value']
+            newip = newip.split('/', 1)[0]
             newipinfo = getaddrinfo(newip, 0)[0]
             newip = newipinfo[-1][0]
             if ':' in newip:
@@ -234,9 +238,10 @@ def remote_nodecfg(nodename, cfm):
             nodename, 'hardwaremanagement.manager')
     ipaddr = cfg.get(nodename, {}).get('hardwaremanagement.manager', {}).get(
         'value', None)
+    ipaddr = ipaddr.split('/', 1)[0]
     ipaddr = getaddrinfo(ipaddr, 0)[0][-1]
     if not ipaddr:
-        raise Excecption('Cannot remote configure a system without known '
+        raise Exception('Cannot remote configure a system without known '
                          'address')
     info = {'addresses': [ipaddr]}
     nh = NodeHandler(info, cfm)

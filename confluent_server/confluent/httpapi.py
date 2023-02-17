@@ -21,9 +21,15 @@ try:
     import Cookie
 except ModuleNotFoundError:
     import http.cookies as Cookie
+try:
+    import confluent.webauthn as webauthn
+except ImportError:
+    webauthn = None
 import confluent.auth as auth
 import confluent.config.attributes as attribs
+import confluent.config.configmanager as configmanager
 import confluent.consoleserver as consoleserver
+import confluent.discovery.core as disco
 import confluent.forwarder as forwarder
 import confluent.exceptions as exc
 import confluent.log as log
@@ -207,6 +213,8 @@ def _should_skip_authlog(env):
     if '/sessions/current/async' in env['PATH_INFO']:
         # this is effectively invisible
         return True
+    if '/sessions/current/webauthn/registered_credentials' in env['PATH_INFO']:
+        return True
     if (env['REQUEST_METHOD'] == 'GET' and
             ('/sensors/' in env['PATH_INFO'] or
              '/health/' in env['PATH_INFO'] or
@@ -263,18 +271,24 @@ def _csrf_valid(env, session):
             env['HTTP_CONFLUENTAUTHTOKEN'] == session['csrftoken'])
 
 
-def _authorize_request(env, operation):
+def _authorize_request(env, operation, reqbody):
     """Grant/Deny access based on data from wsgi env
 
     """
     authdata = None
     name = ''
     sessionid = None
+    sessid = None
     cookie = Cookie.SimpleCookie()
     element = env['PATH_INFO']
     if element.startswith('/sessions/current/'):
-        element = None
-    if 'HTTP_COOKIE' in env:
+        if (element.startswith('/sessions/current/webauthn/registered_credentials/')
+                or element.startswith('/sessions/current/webauthn/validate/')):
+            name = element.rsplit('/')[-1]
+            authdata = auth.authorize(name, element=element, operation=operation)
+        else:
+            element = None
+    if (not authdata) and 'HTTP_COOKIE' in env:
         cidx = (env['HTTP_COOKIE']).find('confluentsessionid=')
         if cidx >= 0:
             sessionid = env['HTTP_COOKIE'][cidx+19:cidx+51]
@@ -322,18 +336,13 @@ def _authorize_request(env, operation):
             return {'code': 403}
         elif not authdata:
             return {'code': 401}
-        sessid = util.randomstring(32)
-        while sessid in httpsessions:
-            sessid = util.randomstring(32)
-        httpsessions[sessid] = {'name': name, 'expiry': time.time() + 90,
-                                'skipuserobject': authdata[4],
-                                'inflight': set([])}
-        if 'HTTP_CONFLUENTAUTHTOKEN' in env:
-            httpsessions[sessid]['csrftoken'] = util.randomstring(32)
-        cookie['confluentsessionid'] = util.stringify(sessid)
-        cookie['confluentsessionid']['secure'] = 1
-        cookie['confluentsessionid']['httponly'] = 1
-        cookie['confluentsessionid']['path'] = '/'
+        sessid = _establish_http_session(env, authdata, name, cookie)
+    if authdata and element and element.startswith('/sessions/current/webauthn/validate/'):
+        if webauthn:
+            for rsp in webauthn.handle_api_request(element, env, None, authdata[2], authdata[1], None, reqbody, None):
+                if rsp['verified']:
+                    sessid = _establish_http_session(env, authdata, name, cookie)
+                    break
     skiplog = _should_skip_authlog(env)
     if authdata:
         auditmsg = {
@@ -352,16 +361,31 @@ def _authorize_request(env, operation):
         auditmsg['user'] = util.stringify(authdata[2])
         if sessid is not None:
             authinfo['sessionid'] = sessid
+            if 'csrftoken' in httpsessions[sessid]:
+                authinfo['authtoken'] = httpsessions[sessid]['csrftoken']
+            httpsessions[sessid]['cfgmgr'] = authdata[1]
         if not skiplog:
             auditlog.log(auditmsg)
-        if 'csrftoken' in httpsessions[sessid]:
-            authinfo['authtoken'] = httpsessions[sessid]['csrftoken']
-        httpsessions[sessid]['cfgmgr'] = authdata[1]
         return authinfo
     elif authdata is None:
         return {'code': 401}
     else:
         return {'code': 403}
+
+def _establish_http_session(env, authdata, name, cookie):
+    sessid = util.randomstring(32)
+    while sessid in httpsessions:
+        sessid = util.randomstring(32)
+    httpsessions[sessid] = {'name': name, 'expiry': time.time() + 90,
+                                'skipuserobject': authdata[4],
+                                'inflight': set([])}
+    if 'HTTP_CONFLUENTAUTHTOKEN' in env:
+        httpsessions[sessid]['csrftoken'] = util.randomstring(32)
+    cookie['confluentsessionid'] = util.stringify(sessid)
+    cookie['confluentsessionid']['secure'] = 1
+    cookie['confluentsessionid']['httponly'] = 1
+    cookie['confluentsessionid']['path'] = '/'
+    return sessid
 
 
 def _pick_mimetype(env):
@@ -391,10 +415,31 @@ def _assign_consessionid(consolesession):
                                'expiry': time.time() + 60}
     return sessid
 
+
+def websockify_data(data):
+    if isinstance(data, dict):
+        data = json.dumps(data)
+        data = u'!' + data
+    else:
+        try:
+            data = data.decode('utf8')
+        except UnicodeDecodeError:
+            data = data.decode('cp437')
+        data = u' ' + data
+    return data
+
+def datacallback_bound(clientsessid, ws):
+    def datacallback(data):
+        data = websockify_data(data)
+        ws.send('${0}$'.format(clientsessid) + data)
+    return datacallback
+
 @eventlet.websocket.WebSocketWSGI.configured(
-    supported_protocols=['confluent.console'])
+    supported_protocols=['confluent.console', 'confluent.asyncweb'])
 def wsock_handler(ws):
     sessid = ws.wait()
+    if not sessid:
+        return
     sessid = sessid.replace('ConfluentSessionId:', '')
     sessid = sessid[:-1]
     currsess = httpsessions.get(sessid, None)
@@ -408,10 +453,96 @@ def wsock_handler(ws):
     mythreadid = greenlet.getcurrent()
     httpsessions[sessid]['inflight'].add(mythreadid)
     name = httpsessions[sessid]['name']
-    authdata = auth.authorize(name, ws.path)
+    authdata = auth.authorize(name, ws.path, operation='start')
     if not authdata:
         return
+    cfgmgr = httpsessions[sessid]['cfgmgr']
+    username = httpsessions[sessid]['name']
+    if ws.path == '/sessions/current/async':
+        myconsoles = {}
+        def asyncwscallback(rsp):
+            rsp = json.dumps(rsp.raw())
+            ws.send(u'!' + rsp)
+        mythreadid = greenlet.getcurrent()
+        currsess['inflight'].add(mythreadid)
+        asess = None
+        try:
+            for asess in confluent.asynchttp.handle_async(
+                    {}, {}, currsess['inflight'], asyncwscallback):
+                ws.send(u' ASYNCID: {0}'.format(asess.asyncid))
+                clientmsg = True
+                while clientmsg:
+                    clientmsg = ws.wait()
+                    if clientmsg:
+                        if clientmsg[0] == '?':
+                            ws.send('?')
+                        elif clientmsg[0] == '$':
+                            targid, data = clientmsg[1:].split('$', 1)
+                            if data[0] == ' ':
+                                myconsoles[targid].write(data[1:])
+                        elif clientmsg[0] == '!':
+                            msg = json.loads(clientmsg[1:])
+                            action = msg.get('operation', None)
+                            targ = msg.get('target', None)
+                            if targ:
+                                authdata = auth.authorize(name, targ, operation=action)
+                                if not authdata:
+                                    continue
+                            if action == 'start':
+                                if '/console/session' in targ or '/shell/sessions' in targ:
+                                    width = msg['width']
+                                    height = msg['height']
+                                    clientsessid = '{0}'.format(msg['sessid'])
+                                    skipreplay = msg.get('skipreplay', False)
+                                    delimit = None
+                                    if '/console/session' in targ:
+                                        delimit = '/console/session'
+                                        shellsession = False
+                                    else:
+                                        delimit = '/shell/sessions'
+                                        shellsession = True
+                                    node = targ.split(delimit, 1)[0]
+                                    node = node.rsplit('/', 1)[-1]
+                                    auditmsg = {'operation': 'start', 'target': targ,
+                                                'user': util.stringify(username)}
+                                    auditlog.log(auditmsg)
+                                    datacallback = datacallback_bound(clientsessid, ws)
+                                    if shellsession:
+                                        consession = shellserver.ShellSession(
+                                            node=node, configmanager=cfgmgr,
+                                            username=username, skipreplay=skipreplay,
+                                            datacallback=datacallback,
+                                            width=width, height=height)
+                                    else:
+                                        consession = consoleserver.ConsoleSession(
+                                            node=node, configmanager=cfgmgr,
+                                            username=username, skipreplay=skipreplay,
+                                            datacallback=datacallback,
+                                            width=width, height=height)
+                                    myconsoles[clientsessid] = consession
+                            elif action == 'stop':
+                                sessid = '{0}'.format(msg.get('sessid', None))
+                                if sessid in myconsoles:
+                                    myconsoles[sessid].destroy()
+                                    del myconsoles[sessid]
+                        else:
+                            print(repr(clientmsg))
+        finally:
+            for cons in myconsoles:
+                myconsoles[cons].destroy()
+            if asess:
+                asess.destroy()
+            currsess['inflight'].discard(mythreadid)
+        return
     if '/console/session' in ws.path or '/shell/sessions/' in ws.path:
+        def datacallback(data):
+            ws.send(websockify_data(data))
+        geom = ws.wait()
+        geom = geom[1:]
+        geom = json.loads(geom)
+        width = geom['width']
+        height = geom['height']
+        skipreplay = geom.get('skipreplay', False)
         #hard bake JSON into this path, do not support other incarnations
         if '/console/session' in ws.path:
             prefix, _, _ = ws.path.partition('/console/session')
@@ -420,24 +551,7 @@ def wsock_handler(ws):
             prefix, _, _ = ws.path.partition('/shell/sessions')
             shellsession = True
         _, _, nodename = prefix.rpartition('/')
-        geom = ws.wait()
-        geom = geom[1:]
-        geom = json.loads(geom)
-        width = geom['width']
-        height = geom['height']
-        skipreplay = geom.get('skipreplay', False)
-        cfgmgr = httpsessions[sessid]['cfgmgr']
-        username = httpsessions[sessid]['name']
-        def datacallback(data):
-            if isinstance(data, dict):
-                data = json.dumps(data)
-                ws.send(u'!' + data)
-            else:
-                try:
-                    data = data.decode('utf8')
-                except UnicodeDecodeError:
-                    data = data.decode('cp437')
-                ws.send(u' ' + data)
+
         try:
             if shellsession:
                 consession = shellserver.ShellSession(
@@ -453,6 +567,8 @@ def wsock_handler(ws):
                 )
         except exc.NotFoundException:
             return
+        mythreadid = greenlet.getcurrent()
+        currsess['inflight'].add(mythreadid)
         clientmsg = ws.wait()
         try:
             while clientmsg is not None:
@@ -470,16 +586,18 @@ def wsock_handler(ws):
                     ws.send(u'?')
                 clientmsg = ws.wait()
         finally:
+            currsess['inflight'].discard(mythreadid)
             consession.destroy()
 
 
 def resourcehandler(env, start_response):
     try:
-        if 'HTTP_SEC_WEBSOCKET_VERSION' in env:
+        if 'HTTP_SEC_WEBSOCKET_VERSION' in env: 
             for rsp in wsock_handler(env, start_response):
                 yield rsp
-        for rsp in resourcehandler_backend(env, start_response):
-            yield rsp
+        else:
+            for rsp in resourcehandler_backend(env, start_response):
+                yield rsp
     except Exception as e:
         tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                      event=log.Events.stacktrace)
@@ -505,6 +623,36 @@ def resourcehandler_backend(env, start_response):
         for res in selfservice.handle_request(env, start_response):
             yield res
         return
+    reqpath = env.get('PATH_INFO', '')
+    if reqpath.startswith('/boot/'):
+        request = env['PATH_INFO'].split('/')
+        if not request[0]:
+            request = request[1:]
+        if len(request) != 4:
+            start_response('400 Bad Request', headers)
+            yield ''
+            return
+        if request[1] == 'by-mac':
+            mac = request[2].replace('-', ':')
+            nodename = disco.get_node_by_uuid_or_mac(mac)
+        elif request[1] == 'by-uuid':
+            uuid = request[2]
+            nodename = disco.get_node_by_uuid_or_mac(uuid)
+        elif request[1] == 'by-node':
+            nodename = request[2]
+        bootfile = request[3]
+        cfg = configmanager.ConfigManager(None)
+        nodec = cfg.get_node_attributes(nodename, 'deployment.pendingprofile')
+        pprofile = nodec.get(nodename, {}).get('deployment.pendingprofile', {}).get('value', None)
+        if not pprofile:
+            start_response('404 Not Found', headers)
+            yield ''
+            return
+        redir = '/confluent-public/os/{0}/boot.{1}'.format(pprofile, bootfile)
+        headers.append(('Location', redir))
+        start_response('302 Found', headers)
+        yield ''
+        return
     if 'CONTENT_LENGTH' in env and int(env['CONTENT_LENGTH']) > 0:
         reqbody = env['wsgi.input'].read(int(env['CONTENT_LENGTH']))
         reqtype = env['CONTENT_TYPE']
@@ -513,7 +661,7 @@ def resourcehandler_backend(env, start_response):
     if operation != 'retrieve' and 'restexplorerop' in querydict:
         operation = querydict['restexplorerop']
         del querydict['restexplorerop']
-    authorized = _authorize_request(env, operation)
+    authorized = _authorize_request(env, operation, reqbody)
     if 'logout' in authorized:
         start_response('200 Successful logout', headers)
         yield('{"result": "200 - Successful logout"}')
@@ -542,7 +690,7 @@ def resourcehandler_backend(env, start_response):
         raise Exception("Unrecognized code from auth engine")
     headers.extend(
         ("Set-Cookie", m.OutputString())
-        for m in authorized['cookie'].values())
+        for m in authorized.get('cookie', {}).values())
     cfgmgr = authorized['cfgmgr']
     if (operation == 'create') and env['PATH_INFO'] == '/sessions/current/async':
         pagecontent = ""
@@ -575,6 +723,7 @@ def resourcehandler_backend(env, start_response):
             start_response('404 Not Found', headers)
             yield 'No hardwaremanagement.manager defined for node'
             return
+        targip = targip.split('/', 1)[0]
         funport = forwarder.get_port(targip, env['HTTP_X_FORWARDED_FOR'],
                                      authorized['sessionid'])
         host = env['HTTP_X_FORWARDED_HOST']
@@ -739,6 +888,14 @@ def resourcehandler_backend(env, start_response):
                 sessinfo['sessionid'] = authorized['sessionid']
             tlvdata.unicode_dictvalues(sessinfo)
             yield json.dumps(sessinfo)
+            return
+        elif url.startswith('/sessions/current/webauthn/'):
+            if not webauthn:
+                start_response('501 Not Implemented', headers)
+                yield ''
+                return
+            for rsp in webauthn.handle_api_request(url, env, start_response, authorized['username'], cfgmgr, headers, reqbody, authorized):
+                yield rsp
             return
         resource = '.' + url[url.rindex('/'):]
         lquerydict = copy.deepcopy(querydict)

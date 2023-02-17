@@ -10,8 +10,12 @@
 nodename=$(grep ^NODENAME /etc/confluent/confluent.info|awk '{print $2}')
 export confluent_mgr confluent_profile nodename
 cp -a /etc/confluent /mnt/sysimage/etc
+mkdir -p /mnt/sysimage/opt/confluent/bin
+cp /opt/confluent/bin/apiclient /mnt/sysimage/opt/confluent/bin/
 chmod -R og-rwx /mnt/sysimage/etc/confluent
 cp /tmp/functions /mnt/sysimage/etc/confluent/
+hostnamectl set-hostname $nodename
+cp /etc/hostname /mnt/sysimage/etc/hostname
 . /tmp/functions
 if [ -f /tmp/cryptboot ]; then
     cp /tmp/cryptboot /mnt/sysimage/tmp/

@@ -10,11 +10,19 @@ import eventlet.green.socket as socket
 import eventlet.green.subprocess as subprocess
 import confluent.discovery.handlers.xcc as xcc
 import confluent.discovery.handlers.tsm as tsm
+import confluent.discovery.core as disco
+import base64
+import hmac
+import hashlib
 import crypt
 import json
 import os
 import time
 import yaml
+import confluent.discovery.protocols.ssdp as ssdp
+import eventlet
+webclient = eventlet.import_patched('pyghmi.util.webclient')
+
 
 currtz = None
 keymap = 'us'
@@ -25,7 +33,7 @@ currtzvintage = None
 def yamldump(input):
     return yaml.safe_dump(input, default_flow_style=False)
 
-def get_extra_names(nodename, cfg):
+def get_extra_names(nodename, cfg, myip=None):
     names = set([])
     dnsinfo = cfg.get_node_attributes(nodename, ('dns.*', 'net.*hostname'))
     dnsinfo = dnsinfo.get(nodename, {})
@@ -41,6 +49,17 @@ def get_extra_names(nodename, cfg):
                     names.add(currname)
                     if domain and domain not in currname:
                         names.add('{0}.{1}'.format(currname, domain))
+    if myip:
+        ncfgs = [netutil.get_nic_config(cfg, nodename, serverip=myip)]
+        fncfg = netutil.get_full_net_config(cfg, nodename, serverip=myip)
+        ncfgs.append(fncfg.get('default', {}))
+        for ent in fncfg.get('extranets', []):
+            ncfgs.append(fncfg['extranets'][ent])
+        for ncfg in ncfgs:
+            for nip in (ncfg.get('ipv4_address', None), ncfg.get('ipv6_address', None)):
+                if nip:
+                    nip = nip.split('/', 1)[0]
+                    names.add(nip)
     return names
 
 def handle_request(env, start_response):
@@ -49,13 +68,72 @@ def handle_request(env, start_response):
     global currlocale
     global currtzvintage
     configmanager.check_quorum()
+    cfg = configmanager.ConfigManager(None)
     nodename = env.get('HTTP_CONFLUENT_NODENAME', None)
+    clientip = env.get('HTTP_X_FORWARDED_FOR', None)
+    if env['PATH_INFO'] == '/self/whoami':
+        clientids = env.get('HTTP_CONFLUENT_IDS', None)
+        if not clientids:
+            start_response('400 Bad Request', [])
+            yield 'Bad Request'
+            return
+        for ids in clientids.split('/'):
+            _, v = ids.split('=', 1)
+            repname = disco.get_node_by_uuid_or_mac(v)
+            if repname:
+                start_response('200 OK', [])
+                yield repname
+                return
+        start_response('404 Unknown', [])
+        yield ''
+        return
+    if env['PATH_INFO'] == '/self/registerapikey':
+        crypthmac = env.get('HTTP_CONFLUENT_CRYPTHMAC', None)
+        if int(env.get('CONTENT_LENGTH', 65)) > 64:
+            start_response('400 Bad Request', [])
+            yield 'Bad Request'
+            return
+        cryptkey = env['wsgi.input'].read(int(env['CONTENT_LENGTH']))
+        if not (crypthmac and cryptkey):
+            start_response('401 Unauthorized', [])
+            yield 'Unauthorized'
+            return
+        hmackey = cfg.get_node_attributes(nodename, ['secret.selfapiarmtoken'], decrypt=True)
+        hmackey = hmackey.get(nodename, {}).get('secret.selfapiarmtoken', {}).get('value', None)
+        if not hmackey:
+            start_response('401 Unauthorized', [])
+            yield 'Unauthorized'
+            return
+        if not isinstance(hmackey, bytes):
+            hmackey = hmackey.encode('utf8')
+        if not isinstance(cryptkey, bytes):
+            cryptkey = cryptkey.encode('utf8')
+        try:
+            crypthmac = base64.b64decode(crypthmac)
+        except Exception:
+            start_response('400 Bad Request', [])
+            yield 'Bad Request'
+            return
+        righthmac = hmac.new(hmackey, cryptkey, hashlib.sha256).digest()
+        if righthmac == crypthmac:
+            cfgupdate = {nodename: {'crypted.selfapikey': {'hashvalue': cryptkey}}}
+            cfg.set_node_attributes(cfgupdate)
+            cfg.clear_node_attributes([nodename], ['secret.selfapiarmtoken'])
+            start_response('200 OK', [])
+            yield 'Accepted'
+            return
+        start_response('401 Unauthorized', [])
+        yield 'Unauthorized'
+        return
     apikey = env.get('HTTP_CONFLUENT_APIKEY', None)
     if not (nodename and apikey):
         start_response('401 Unauthorized', [])
         yield 'Unauthorized'
         return
-    cfg = configmanager.ConfigManager(None)
+    if len(apikey) > 48:
+        start_response('401', [])
+        yield 'Unauthorized'
+        return
     ea = cfg.get_node_attributes(nodename, ['crypted.selfapikey', 'deployment.apiarmed'])
     eak = ea.get(
         nodename, {}).get('crypted.selfapikey', {}).get('hashvalue', None)
@@ -63,6 +141,8 @@ def handle_request(env, start_response):
         start_response('401 Unauthorized', [])
         yield 'Unauthorized'
         return
+    if not isinstance(eak, str):
+        eak = eak.decode('utf8')
     salt = '$'.join(eak.split('$', 3)[:-1]) + '$'
     if crypt.crypt(apikey, salt) != eak:
         start_response('401 Unauthorized', [])
@@ -70,6 +150,13 @@ def handle_request(env, start_response):
         return
     if ea.get(nodename, {}).get('deployment.apiarmed', {}).get('value', None) == 'once':
         cfg.set_node_attributes({nodename: {'deployment.apiarmed': ''}})
+    myip = env.get('HTTP_X_FORWARDED_HOST', None)
+    if myip and ']' in myip:
+        myip = myip.split(']', 1)[0]
+    elif myip:
+        myip = myip.split(':', 1)[0]
+    if myip:
+        myip = myip.replace('[', '').replace(']', '')
     retype = env.get('HTTP_ACCEPT', 'application/yaml')
     isgeneric = False
     if retype == '*/*':
@@ -86,6 +173,50 @@ def handle_request(env, start_response):
     operation = env['REQUEST_METHOD']
     if operation not in ('HEAD', 'GET') and 'CONTENT_LENGTH' in env and int(env['CONTENT_LENGTH']) > 0:
         reqbody = env['wsgi.input'].read(int(env['CONTENT_LENGTH']))
+    if env['PATH_INFO'] == '/self/register_discovered':
+        rb = json.loads(reqbody)
+        if not rb.get('path', None):
+            start_response('400 Bad Requst', [])
+            yield 'Missing Path'
+            return
+        targurl = '/affluent/systems/by-port/{0}/webaccess'.format(rb['path'])
+        tlsverifier = util.TLSCertVerifier(cfg, nodename, 'pubkeys.tls_hardwaremanager')
+        wc = webclient.SecureHTTPConnection(nodename, 443, verifycallback=tlsverifier.verify_cert)
+        relaycreds = cfg.get_node_attributes(nodename, 'secret.*', decrypt=True)
+        relaycreds = relaycreds.get(nodename, {})
+        relayuser = relaycreds.get('secret.hardwaremanagementuser', {}).get('value', None)
+        relaypass = relaycreds.get('secret.hardwaremanagementpassword', {}).get('value', None)
+        if not relayuser or not relaypass:
+            raise Exception('No credentials for {0}'.format(nodename))
+        wc.set_basic_credentials(relayuser, relaypass)
+        wc.request('GET', targurl)
+        rsp = wc.getresponse()
+        _ = rsp.read()
+        if rsp.status == 302:
+            newurl = rsp.headers['Location']
+            newhost, newport = newurl.replace('https://', '').split('/')[0].split(':')
+            def verify_cert(certificate):
+                hashval = base64.b64decode(rb['fingerprint'])
+                if len(hashval) == 48:
+                    return hashlib.sha384(certificate).digest() == hashval
+                raise Exception('Certificate validation failed')
+            rb['addresses'] = [(newhost, newport)]
+            rb['forwarder_url'] = targurl
+            rb['forwarder_server'] = nodename
+            if 'bay' in rb:
+                rb['enclosure.bay'] = rb['bay']
+            if rb['type'] == 'lenovo-xcc':
+                ssdp.check_fish(('/DeviceDescription.json', rb), newport, verify_cert)
+            elif rb['type'] == 'lenovo-smm2':
+                rb['services'] = ['service:lenovo-smm2']
+            else:
+                start_response('400 Unsupported Device', [])
+                yield 'Unsupported device for remote discovery registration'
+                return
+        disco.detected(rb)
+        start_response('200 OK', [])
+        yield 'Registered'
+        return
     if env['PATH_INFO'] == '/self/bmcconfig':
         hmattr = cfg.get_node_attributes(nodename, 'hardwaremanagement.*')
         hmattr = hmattr.get(nodename, {})
@@ -98,6 +229,7 @@ def handle_request(env, start_response):
             res['bmcvlan'] = vlan
         bmcaddr = hmattr.get('hardwaremanagement.manager', {}).get('value',
                                                                    None)
+        bmcaddr = bmcaddr.split('/', 1)[0]
         bmcaddr = socket.getaddrinfo(bmcaddr, 0)[0]
         bmcaddr = bmcaddr[-1][0]
         if '.' in bmcaddr:  # ipv4 is allowed
@@ -108,17 +240,34 @@ def handle_request(env, start_response):
         # credential security results in user/password having to be deferred
         start_response('200 OK', (('Content-Type', retype),))
         yield dumper(res)
-    elif env['PATH_INFO'] == '/self/deploycfg':
+    elif env['PATH_INFO'] == '/self/myattribs':
+        cfd = cfg.get_node_attributes(nodename, '*').get(nodename, {})
+        rsp = {}
+        for k in cfd:
+            if k.startswith('secret') or k.startswith('crypt') or 'value' not in cfd[k] or not cfd[k]['value']:
+                continue
+            rsp[k] = cfd[k]['value']
+        start_response('200 OK', (('Conntent-Type', retype),))
+        yield dumper(rsp)
+    elif env['PATH_INFO'] == '/self/netcfg':
+        ncfg = netutil.get_full_net_config(cfg, nodename, myip)
+        start_response('200 OK', (('Content-Type', retype),))
+        yield dumper(ncfg)
+    elif env['PATH_INFO'] in ('/self/deploycfg', '/self/deploycfg2'):
         if 'HTTP_CONFLUENT_MGTIFACE' in env:
-            ncfg = netutil.get_nic_config(cfg, nodename, ifidx=env['HTTP_CONFLUENT_MGTIFACE'])
+            nicname = env['HTTP_CONFLUENT_MGTIFACE']
+            try:
+                ifidx = int(nicname)
+            except ValueError:
+                with open('/sys/class/net/{}/ifindex'.format(nicname), 'r') as nici:
+                    ifidx = int(nici.read())
+            ncfg = netutil.get_nic_config(cfg, nodename, ifidx=ifidx)
         else:
-            myip = env.get('HTTP_X_FORWARDED_HOST', None)
-            if ']' in myip:
-                myip = myip.split(']', 1)[0]
-            else:
-                myip = myip.split(':', 1)[0]
-            myip = myip.replace('[', '').replace(']', '')
             ncfg = netutil.get_nic_config(cfg, nodename, serverip=myip)
+        if env['PATH_INFO'] == '/self/deploycfg':
+            for key in list(ncfg):
+                if 'v6' in key:
+                    del ncfg[key]
         if ncfg['prefix']:
             ncfg['ipv4_netmask'] = netutil.cidr_to_mask(ncfg['prefix'])
         if ncfg['ipv4_method'] == 'firmwaredhcp':
@@ -136,6 +285,7 @@ def handle_request(env, start_response):
         ncfg['profile'] = profile
         protocol = deployinfo.get('deployment.useinsecureprotocols', {}).get(
             'value', 'never')
+        ncfg['confluent_uuid'] = configmanager.get_global('confluent_uuid')
         ncfg['textconsole'] = bool(deployinfo.get(
                                   'console.method', {}).get('value', None))
         if protocol == 'always':
@@ -149,30 +299,66 @@ def handle_request(env, start_response):
         if currtzvintage and currtzvintage > (time.time() - 30.0):
             ncfg['timezone'] = currtz
         else:
-            langinfo = subprocess.check_output(
-                ['localectl', 'status']).split(b'\n')
-            for line in langinfo:
-                line = line.strip()
-                if line.startswith(b'System Locale:'):
-                    ccurrlocale = line.split(b'=')[-1]
-                    if not ccurrlocale:
-                        continue
-                    if not isinstance(ccurrlocale, str):
-                        ccurrlocale = ccurrlocale.decode('utf8')
-                    if ccurrlocale == 'n/a':
-                        continue
-                    currlocale = ccurrlocale
-                elif line.startswith(b'VC Keymap:'):
-                    ckeymap = line.split(b':')[-1]
-                    ckeymap = ckeymap.strip()
-                    if not ckeymap:
-                        continue
-                    if not isinstance(ckeymap, str):
-                        ckeymap = ckeymap.decode('utf8')
-                    if ckeymap == 'n/a':
-                        continue
-                    keymap = ckeymap
-            tdc = subprocess.check_output(['timedatectl']).split(b'\n')
+            needlocalectl = True
+            try:
+                with open('/etc/vconsole.conf') as consconf:
+                    for line in consconf.read().split('\n'):
+                        line = line.split('#', 1)[0]
+                        if '=' not in line:
+                            continue
+                        k, v = line.split('=', 1)
+                        if k == 'KEYMAP':
+                            keymap = v.replace('"', '')
+                            needlocalectl = False
+                if not needlocalectl:
+                    needlocalectl = True
+                    localeconf = None
+                    if os.path.exists('/etc/locale.conf'):
+                        localeconf = '/etc/locale.conf'
+                    elif os.path.exists('/etc/default/locale'):
+                        localeconf = '/etc/default/locale'
+                    if localeconf:
+                        with open(localeconf) as lcin:
+                            for line in lcin.read().split('\n'):
+                                line = line.split('#', 1)[0]
+                                if '=' not in line:
+                                    continue
+                                k, v = line.split('=', 1)
+                                if k == 'LANG':
+                                    needlocalectl = False
+                                    currlocale = v.replace('"', '')
+            except IOError:
+                pass
+            if needlocalectl:
+                try:
+                    langinfo = util.run(['localectl', 'status'])[0].split(b'\n')
+                except Exception:
+                    langinfo = []
+                for line in langinfo:
+                    line = line.strip()
+                    if line.startswith(b'System Locale:'):
+                        ccurrlocale = line.split(b'=')[-1]
+                        if not ccurrlocale:
+                            continue
+                        if not isinstance(ccurrlocale, str):
+                            ccurrlocale = ccurrlocale.decode('utf8')
+                        if ccurrlocale == 'n/a':
+                            continue
+                        currlocale = ccurrlocale
+                    elif line.startswith(b'VC Keymap:'):
+                        ckeymap = line.split(b':')[-1]
+                        ckeymap = ckeymap.strip()
+                        if not ckeymap:
+                            continue
+                        if not isinstance(ckeymap, str):
+                            ckeymap = ckeymap.decode('utf8')
+                        if ckeymap == 'n/a':
+                            continue
+                        keymap = ckeymap
+            try:
+                tdc = util.run(['timedatectl'])[0].split(b'\n')
+            except subprocess.CalledProcessError:
+                tdc = []
             for ent in tdc:
                 ent = ent.strip()
                 if ent.startswith(b'Time zone:'):
@@ -204,7 +390,7 @@ def handle_request(env, start_response):
             start_response('500 Unconfigured', ())
             yield 'CA is not configured on this system (run ...)'
             return
-        pals = get_extra_names(nodename, cfg)
+        pals = get_extra_names(nodename, cfg, myip)
         cert = sshutil.sign_host_key(reqbody, nodename, pals)
         start_response('200 OK', (('Content-Type', 'text/plain'),))
         yield cert
@@ -234,6 +420,19 @@ def handle_request(env, start_response):
         yield 'complete'
     elif env['PATH_INFO'] == '/self/updatestatus' and reqbody:
         update = yaml.safe_load(reqbody)
+        statusstr = update.get('state', None)
+        statusdetail = update.get('state_detail', None)
+        didstateupdate = False
+        if statusstr:
+            cfg.set_node_attributes({nodename: {'deployment.state': statusstr}})
+            didstateupdate = True
+        if statusdetail:
+            cfg.set_node_attributes({nodename: {'deployment.state_detail': statusdetail}})
+            didstateupdate = True
+        if 'status' not in update and didstateupdate:
+            start_response('200 Ok', ())
+            yield 'Accepted'
+            return
         if update['status'] == 'staged':
             targattr = 'deployment.stagedprofile'
         elif update['status'] == 'complete':
@@ -292,14 +491,16 @@ def handle_request(env, start_response):
             return
     elif env['PATH_INFO'].startswith('/self/remotesyncfiles'):
         if 'POST' == operation:
+            pals = get_extra_names(nodename, cfg, myip)
             result = syncfiles.start_syncfiles(
-                nodename, cfg, json.loads(reqbody))
+                nodename, cfg, json.loads(reqbody), pals)
             start_response(result, ())
             yield ''
             return
         if 'GET' == operation:
             status, output = syncfiles.get_syncresult(nodename)
-            start_response(status, ())
+            output = json.dumps(output)
+            start_response(status, (('Content-Type', 'application/json'),))
             yield output
             return
     elif env['PATH_INFO'].startswith('/self/remoteconfig/status'):
@@ -324,6 +525,27 @@ def handle_request(env, start_response):
         else:
             start_response('200 OK', ())
             yield ''
+    elif env['PATH_INFO'].startswith('/self/profileprivate/pending/'):
+        fname = env['PATH_INFO'].replace('/self/profileprivate/', '')
+        deployinfo = cfg.get_node_attributes(
+        nodename, ('deployment.*',))
+        deployinfo = deployinfo.get(nodename, {})
+        profile = deployinfo.get(
+            'deployment.pendingprofile', {}).get('value', '')
+        if not profile:
+            start_response('400 No pending profile', ())
+            yield 'No profile'
+            return
+        fname = '/var/lib/confluent/private/os/{}/{}'.format(profile, fname)
+        try:
+            with open(fname, 'rb') as privdata:
+                start_response('200 OK', ())
+                yield privdata.read()
+                return
+        except IOError:
+            start_response('404 Not Found', ())
+            yield 'Not found'
+            return
     else:
         start_response('404 Not Found', ())
         yield 'Not found'

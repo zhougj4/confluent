@@ -79,9 +79,14 @@ import confluent.messages as msg
 import confluent.networking.macmap as macmap
 import confluent.noderange as noderange
 import confluent.util as util
+import json
 import eventlet
 import traceback
+import shlex
+import struct
+import eventlet.green.socket as socket
 import socket as nsocket
+import eventlet.green.subprocess as subprocess
 webclient = eventlet.import_patched('pyghmi.util.webclient')
 
 
@@ -106,11 +111,12 @@ class nesteddict(dict):
 nodehandlers = {
     'service:lenovo-smm': smm,
     'service:lenovo-smm2': smm,
-    'service:management-hardware.Lenovo:lenovo-xclarity-controller': xcc,
+    'lenovo-xcc': xcc,
     'service:management-hardware.IBM:integrated-management-module2': imm,
     'pxe-client': pxeh,
     'onie-switch': None,
     'cumulus-switch': None,
+    'affluent-switch': None,
     'service:io-device.Lenovo:management-module': None,
     'service:thinkagile-storage': cpstorage,
     'service:lenovo-tsm': tsm,
@@ -122,7 +128,8 @@ servicenames = {
     'cumulus-switch': 'cumulus-switch',
     'service:lenovo-smm': 'lenovo-smm',
     'service:lenovo-smm2': 'lenovo-smm2',
-    'service:management-hardware.Lenovo:lenovo-xclarity-controller': 'lenovo-xcc',
+    'affluent-switch': 'affluent-switch',
+    'lenovo-xcc': 'lenovo-xcc',
     'service:management-hardware.IBM:integrated-management-module2': 'lenovo-imm2',
     'service:io-device.Lenovo:management-module': 'lenovo-switch',
     'service:thinkagile-storage': 'thinkagile-storagebmc',
@@ -135,7 +142,8 @@ servicebyname = {
     'cumulus-switch': 'cumulus-switch',
     'lenovo-smm': 'service:lenovo-smm',
     'lenovo-smm2': 'service:lenovo-smm2',
-    'lenovo-xcc': 'service:management-hardware.Lenovo:lenovo-xclarity-controller',
+    'affluent-switch': 'affluent-switch',
+    'lenovo-xcc': 'lenovo-xcc',
     'lenovo-imm2': 'service:management-hardware.IBM:integrated-management-module2',
     'lenovo-switch': 'service:io-device.Lenovo:management-module',
     'thinkagile-storage': 'service:thinkagile-storagebmc',
@@ -182,6 +190,10 @@ pending_nodes = {}
 pending_by_uuid = {}
 
 
+def register_affluent(affluenthdl):
+    global affluent
+    affluent = affluenthdl
+
 def enrich_pxe_info(info):
     sn = None
     mn = None
@@ -205,6 +217,7 @@ def uuid_is_valid(uuid):
     return uuid.lower() not in ('00000000-0000-0000-0000-000000000000',
                                 'ffffffff-ffff-ffff-ffff-ffffffffffff',
                                 '00112233-4455-6677-8899-aabbccddeeff',
+                                '03000200-0400-0500-0006-000700080009',
                                 '20202020-2020-2020-2020-202020202020')
 
 def _printable_ip(sa):
@@ -216,7 +229,12 @@ def send_discovery_datum(info):
     if info['handler'] == pxeh:
         enrich_pxe_info(info)
     yield msg.KeyValueData({'nodename': info.get('nodename', '')})
-    yield msg.KeyValueData({'ipaddrs': [_printable_ip(x) for x in addresses]})
+    if not info.get('forwarder_server', None):
+        yield msg.KeyValueData({'ipaddrs': [_printable_ip(x) for x in addresses]})
+    switch = info.get('forwarder_server', None)
+    if switch:
+        yield msg.KeyValueData({'switch': switch})
+        yield msg.KeyValueData({'switchport': info['port']})
     sn = info.get('serialnumber', '')
     mn = info.get('modelnumber', '')
     uuid = info.get('uuid', '')
@@ -341,6 +359,14 @@ def show_info(mac):
     for i in send_discovery_datum(known_info[mac]):
         yield i
 
+def dump_discovery():
+    infobymac = {}
+    for mac in known_info:
+        infobymac[mac] = {}
+        for i in send_discovery_datum(known_info[mac]):
+            for kn in i.kvpairs:
+                infobymac[mac][kn] = i.kvpairs[kn]
+    yield msg.KeyValueData(infobymac)
 
 list_info = {
     'by-node': list_matching_nodes,
@@ -371,6 +397,59 @@ single_selectors = set([
 ])
 
 
+def addr_to_number(addr):
+    addr = socket.inet_pton(socket.AF_INET, addr)
+    num = struct.unpack('!I', addr)[0]
+    return num
+
+def number_to_addr(number):
+    addr = struct.pack('!I', number)
+    addr = socket.inet_ntop(socket.AF_INET, addr)
+    return addr
+
+def iterate_addrs(addrs, countonly=False):
+    if '.' not in addrs:
+        raise exc.InvalidArgumentException('IPv4 only supported')
+    if '-' in addrs:
+        first, last = addrs.split('-', 1)
+        currn = addr_to_number(first)
+        last = addr_to_number(last)
+        if last < currn:
+            tm = currn
+            currn = last
+            currn = tm
+        if (last - currn) > 65538:
+            raise exc.InvalidArgumentException("Too many ip addresses")
+        if countonly:
+            yield last - currn + 1
+            return
+        while currn <= last:
+            yield number_to_addr(currn)
+            currn += 1
+    elif '/' in addrs:
+        first, plen = addrs.split('/', 1)
+        plen = int(plen)
+        if plen > 32:
+            raise exc.InvalidArgumentException("Invalid prefix length")
+        mask = (2**32 - 1) ^ (2**(32 - plen) - 1)
+        currn = addr_to_number(first)
+        currn = currn & mask
+        numips = 2**(32 - plen)
+        if numips > 65538:
+            raise exc.InvalidArgumentException("Too many ip addresses")
+        if countonly:
+            yield numips
+            return
+        while numips > 0:
+            yield number_to_addr(currn)
+            currn += 1
+            numips -= 1
+    else:
+        if countonly:
+            yield 1
+            return
+        yield addrs
+    
 def _parameterize_path(pathcomponents):
     listrequested = False
     childcoll = True
@@ -414,11 +493,53 @@ def handle_autosense_config(operation, inputdata):
         else:
             stop_autosense()
 
+def get_subscriptions():
+    try:
+        with open('/etc/confluent/discovery_subscriptions.json', 'r') as ds:
+            dst = ds.read()
+            if dst:
+                return json.loads(dst)
+    except Exception:
+        pass
+    return {}
+
+def save_subscriptions(subs):
+    with open('/etc/confluent/discovery_subscriptions.json', 'w') as dso:
+        dso.write(json.dumps(subs))
+
+
+def register_remote_addrs(addresses, configmanager):
+    def register_remote_addr(addr):
+        nd = {
+            'addresses': [(addr, 443)]
+        }
+        sd = ssdp.check_fish(('/DeviceDescription.json', nd))
+        if not sd:
+            return addr, False
+        sd['hwaddr'] = sd['attributes']['mac-address']
+        nh = xcc.NodeHandler(sd, configmanager)
+        nh.scan()
+        detected(nh.info)
+        return addr, True
+    rpool = eventlet.greenpool.GreenPool(512)
+    for count in iterate_addrs(addresses, True):
+        yield msg.ConfluentResourceCount(count)
+    for result in rpool.imap(register_remote_addr, iterate_addrs(addresses)):
+        if result[1]:
+            yield msg.CreatedResource(result[0])
+        else:
+            yield msg.ConfluentResourceNotFound(result[0])
+
 
 def handle_api_request(configmanager, inputdata, operation, pathcomponents):
     if pathcomponents == ['discovery', 'autosense']:
         return handle_autosense_config(operation, inputdata)
-    if operation == 'retrieve':
+    if operation == 'retrieve' and pathcomponents[:2] == ['discovery', 'subscriptions']:
+        if len(pathcomponents) > 2:
+            raise Exception('TODO')
+        currsubs = get_subscriptions()
+        return [msg.ChildCollection(x) for x in currsubs]    
+    elif operation == 'retrieve':
         return handle_read_api_request(pathcomponents)
     elif (operation in ('update', 'create') and
             pathcomponents == ['discovery', 'rescan']):
@@ -426,8 +547,26 @@ def handle_api_request(configmanager, inputdata, operation, pathcomponents):
             raise exc.InvalidArgumentException()
         rescan()
         return (msg.KeyValueData({'rescan': 'started'}),)
-
+    elif operation in ('update', 'create') and pathcomponents[:2] == ['discovery', 'subscriptions']:
+        target = pathcomponents[2]
+        affluent.subscribe_discovery(target, configmanager, collective.get_myname())
+        currsubs = get_subscriptions()
+        currsubs[target] = {}
+        save_subscriptions(currsubs)
+        return (msg.KeyValueData({'status': 'subscribed'}),)
+    elif operation == 'delete' and pathcomponents[:2] == ['discovery', 'subscriptions']:
+        target = pathcomponents[2]
+        affluent.unsubscribe_discovery(target, configmanager, collective.get_myname())
+        currsubs = get_subscriptions()
+        if target in currsubs:
+            del currsubs[target]
+            save_subscriptions(currsubs)
+        return (msg.KeyValueData({'status': 'unsubscribed'}),)
     elif operation in ('update', 'create'):
+        if pathcomponents == ['discovery', 'register']:
+            if 'addresses' not in inputdata:
+                raise exc.InvalidArgumentException('Missing address in input')
+            return register_remote_addrs(inputdata['addresses'], configmanager)
         if 'node' not in inputdata:
             raise exc.InvalidArgumentException('Missing node name in input')
         mac = _get_mac_from_query(pathcomponents)
@@ -471,11 +610,15 @@ def handle_read_api_request(pathcomponents):
     # starting at 2 are parameters to previous index
     if pathcomponents == ['discovery', 'rescan']:
         return (msg.KeyValueData({'scanning': bool(scanner)}),)
+    if pathcomponents == ['discovery', 'alldata']:
+        return dump_discovery()
     subcats, queryparms, indexof, coll = _parameterize_path(pathcomponents[1:])
     if len(pathcomponents) == 1:
         dirlist = [msg.ChildCollection(x + '/') for x in sorted(list(subcats))]
         dirlist.append(msg.ChildCollection('rescan'))
         dirlist.append(msg.ChildCollection('autosense'))
+        dirlist.append(msg.ChildCollection('alldata'))
+        dirlist.append(msg.ChildCollection('subscriptions/'))
         return dirlist
     if not coll:
         return show_info(queryparms['by-mac'])
@@ -634,18 +777,6 @@ def detected(info):
         eventlet.spawn_after(10, info['protocol'].fix_info, info,
                              safe_detected)
         return
-    try:
-        snum = info['attributes']['enclosure-serial-number'][0].strip()
-        if snum:
-            info['serialnumber'] = snum
-            known_serials[info['serialnumber']] = info
-    except (KeyError, IndexError):
-        pass
-    try:
-        info['modelnumber'] = info['attributes']['enclosure-machinetype-model'][0]
-        known_services[service].add(info['modelnumber'])
-    except (KeyError, IndexError):
-        pass
     if info['hwaddr'] in known_info and 'addresses' in info:
         # we should tee these up for parsing when an enclosure comes up
         # also when switch config parameters change, should discard
@@ -677,11 +808,29 @@ def detected(info):
     if handler:
         handler = handler.NodeHandler(info, cfg)
         handler.scan()
+    try:
+        if 'modelnumber' not in info:
+            info['modelnumber'] = info['attributes']['enclosure-machinetype-model'][0]
+    except (KeyError, IndexError):
+        pass
+    if 'modelnumber' in info:
+        known_services[service].add(info['modelnumber'])
+    try:
+        if 'serialnumber' not in info:
+            snum = info['attributes']['enclosure-serial-number'][0].strip()
+            if snum:
+                info['serialnumber'] = snum
+    except (KeyError, IndexError):
+        pass
+    if 'serialnumber' in info:
+        known_serials[info['serialnumber']] = info
     uuid = info.get('uuid', None)
     if uuid_is_valid(uuid):
         known_uuids[uuid][info['hwaddr']] = info
     info['otheraddresses'] = set([])
     for i4addr in info.get('attributes', {}).get('ipv4-address', []):
+        info['otheraddresses'].add(i4addr)
+    for i4addr in info.get('attributes', {}).get('ipv4-addresses', []):
         info['otheraddresses'].add(i4addr)
     if handler and handler.https_supported and not handler.https_cert:
         if handler.cert_fail_reason == 'unreachable':
@@ -711,13 +860,25 @@ def detected(info):
     nodename, info['maccount'] = get_nodename(cfg, handler, info)
     if nodename and handler and handler.https_supported:
         dp = cfg.get_node_attributes([nodename],
-                                     ('pubkeys.tls_hardwaremanager',))
-        lastfp = dp.get(nodename, {}).get('pubkeys.tls_hardwaremanager',
+                                     ('pubkeys.tls_hardwaremanager', 'id.uuid', 'discovery.policy'))
+        dp = dp.get(nodename, {})
+        lastfp = dp.get('pubkeys.tls_hardwaremanager',
                                           {}).get('value', None)
         if util.cert_matches(lastfp, handler.https_cert):
             info['nodename'] = nodename
             known_nodes[nodename][info['hwaddr']] = info
             info['discostatus'] = 'discovered'
+            uuid = info.get('uuid', None)
+            if uuid:
+                storeuuid = dp.get('id.uuid', {}).get('value', None)
+                if not storeuuid:
+                    discop = dp.get('discovery.policy', {}).get('value', '')
+                    if discop:
+                        policies = set(discop.split(','))
+                    else:
+                        policies = set([])
+                    if policies & {'open', 'permissive'}:
+                        cfg.set_node_attributes({nodename: {'id.uuid': info['uuid']}})
             return  # already known, no need for more
     #TODO(jjohnson2): We might have to get UUID for certain searches...
     #for now defer probe until inside eval_node.  We might not have
@@ -794,6 +955,7 @@ def get_chained_smm_name(nodename, cfg, handler, nl=None, checkswitch=True):
         smmaddr = cd.get(nodename, {}).get('hardwaremanagement.manager', {}).get('value', None)
         if not smmaddr:
             return None, False
+        smmaddr = smmaddr.split('/', 1)[0]
         if pkey:
             cv = util.TLSCertVerifier(
                 cfg, nodename, 'pubkeys.tls_hardwaremanager').verify_cert
@@ -825,6 +987,47 @@ def get_smm_neighbor_fingerprints(smmaddr, cv):
             continue
         yield 'sha256$' + b64tohex(neigh['sha256'])
 
+def get_nodename_sysdisco(cfg, handler, info):
+    switchname = info['forwarder_server']
+    switchnode = None
+    nl = cfg.filter_node_attributes('net.*switch=' + switchname)
+    brokenattrs = False
+    for n in nl:
+        na = cfg.get_node_attributes(n, 'net.*switchport').get(n, {})
+        for sp in na:
+            pv = na[sp].get('value', '')
+            if pv and macmap._namesmatch(info['port'], pv):
+                if switchnode:
+                    log.log({'error': 'Ambiguous port information between {} and {}'.format(switchnode, n)})
+                    brokenattrs = True
+                else:
+                    switchnode = n
+                break
+    if brokenattrs or not switchnode:
+        return None
+    if 'enclosure_num' not in info:
+        return switchnode
+    chainlen = info['enclosure_num']
+    currnode = switchnode
+    while chainlen > 1:
+        nl = list(cfg.filter_node_attributes('enclosure.extends=' + currnode))
+        if len(nl) > 1:
+            log.log({'error': 'Multiple enclosures specify extending ' + currnode})
+            return None
+        if len(nl) == 0:
+            log.log({'error': 'No enclosures specify extending ' + currnode + ' but an enclosure seems to be extending it'})
+            return None
+        currnode = nl[0]
+        chainlen -= 1
+    if info['type'] == 'lenovo-smm2':
+        return currnode
+    else:
+        baynum = info['bay']
+        nl = cfg.filter_node_attributes('enclosure.manager=' + currnode)
+        nl = list(cfg.filter_node_attributes('enclosure.bay={0}'.format(baynum), nl))
+        if len(nl) == 1:
+            return nl[0]
+
 
 def get_nodename(cfg, handler, info):
     nodename = None
@@ -850,6 +1053,15 @@ def get_nodename(cfg, handler, info):
             if nodename is None:
                 _map_unique_ids()
                 nodename = nodes_by_uuid.get(curruuid, None)
+    if not nodename and info['handler'] == pxeh:
+        enrich_pxe_info(info)
+        nodename = info.get('nodename', None)
+    if 'forwarder_server' in info:
+        # this has been registered by a remote discovery registry,
+        # thus verification and specific location is fixed
+        if nodename:
+            return nodename, None
+        return get_nodename_sysdisco(cfg, handler, info), None
     if not nodename:
         # Ok, see if it is something with a chassis-uuid and discover by
         # chassis
@@ -912,6 +1124,13 @@ def get_nodename_from_chained_smms(cfg, handler, info):
                 nodename = newnodename
     return nodename
 
+def get_node_guess_by_uuid(uuid):
+    for mac in known_uuids.get(uuid, {}):
+        nodename = known_uuids[uuid][mac].get('nodename', None)
+        if nodename:
+            return nodename
+    return None
+
 def get_node_by_uuid_or_mac(uuidormac):
     node = pxe.macmap.get(uuidormac, None)
     if node is not None:
@@ -920,7 +1139,9 @@ def get_node_by_uuid_or_mac(uuidormac):
 
 def get_nodename_from_enclosures(cfg, info):
     nodename = None
-    cuuid = info.get('attributes', {}).get('chassis-uuid', [None])[0]
+    cuuid = info.get('enclosure.uuid', None)
+    if not cuuid:
+        cuuid = info.get('attributes', {}).get('chassis-uuid', [None])[0]
     if cuuid and cuuid in nodes_by_uuid:
         encl = nodes_by_uuid[cuuid]
         bay = info.get('enclosure.bay', None)
@@ -934,6 +1155,38 @@ def get_nodename_from_enclosures(cfg, info):
                 # uuid instead of a key
                 nodename = tnl[0]
     return nodename
+
+
+def search_smms_by_cert(currsmm, cert, cfg):
+    neighs = []
+    cv = util.TLSCertVerifier(
+        cfg, currsmm, 'pubkeys.tls_hardwaremanager').verify_cert
+    try:
+        cd = cfg.get_node_attributes(currsmm, ['hardwaremanagement.manager',
+                                               'pubkeys.tls_hardwaremanager'])
+        smmaddr = cd.get(currsmm, {}).get('hardwaremanagement.manager', {}).get('value', None)
+        wc = webclient.SecureHTTPConnection(currsmm, verifycallback=cv)
+        neighs = wc.grab_json_response('/scripts/neighdata.json')
+    except Exception:
+        return None
+    for neigh in neighs:
+        fprint = neigh.get('sha384', None)
+        if fprint and fprint.endswith('AA=='):
+            fprint = fprint[:-4]
+        if fprint and util.cert_matches(fprint, cert):
+            port = neigh.get('port', None)
+            if port is not None:
+                bay = port + 1
+                nl = list(
+                    cfg.filter_node_attributes('enclosure.manager=' + currsmm))
+                nl = list(
+                    cfg.filter_node_attributes('enclosure.bay={}'.format(bay), nl))
+                if len(nl) == 1:
+                    return currsmm, bay, nl[0]
+                return currsmm, bay, None
+    exnl = list(cfg.filter_node_attrubutes('enclosure.extends=' + currsmm))
+    if len(exnl) == 1:
+        return search_smms_by_cert(exnl[0], cert, cfg)
 
 
 def eval_node(cfg, handler, info, nodename, manual=False):
@@ -970,6 +1223,14 @@ def eval_node(cfg, handler, info, nodename, manual=False):
         # The specified node is an enclosure (has nodes mapped to it), but
         # what we are talking to is *not* an enclosure
         # might be ambiguous, need to match chassis-uuid as well..
+        match = search_smms_by_cert(nodename, handler.https_cert, cfg)
+        if match:
+            info['verfied'] = True
+            info['enclosure.bay'] = match[1]
+            if match[2]:
+                if not discover_node(cfg, handler, info, match[2], manual):
+                    pending_nodes[match[2]] = nodename
+                return
         if 'enclosure.bay' not in info:
             unknown_info[info['hwaddr']] = info
             info['discostatus'] = 'unidentified'
@@ -1090,7 +1351,7 @@ def discover_node(cfg, handler, info, nodename, manual):
         del unknown_info[info['hwaddr']]
     info['discostatus'] = 'identified'
     dp = cfg.get_node_attributes(
-        [nodename], ('discovery.policy',
+        [nodename], ('discovery.policy', 'id.uuid',
                      'pubkeys.tls_hardwaremanager'))
     policy = dp.get(nodename, {}).get('discovery.policy', {}).get(
         'value', None)
@@ -1115,7 +1376,15 @@ def discover_node(cfg, handler, info, nodename, manual):
                          'pubkeys.tls_hardwaremanager attribute is cleared '
                          'first'.format(nodename)})
         return False  # With a permissive policy, do not discover new
-    elif policies & set(('open', 'permissive')) or manual:
+    elif policies & set(('open', 'permissive', 'verified')) or manual:
+        if 'verified' in policies:
+            if not handler.https_supported or not util.cert_matches(info['fingerprint'], handler.https_cert):
+                log.log({'info': 'Detected replacement of {0} without verified '
+                         'fingerprint and discovery policy is set to verified, not '
+                         'doing discovery unless discovery.policy=open or '
+                         'pubkeys.tls_hardwaremanager attribute is cleared '
+                         'first'.format(nodename)})
+                return False
         info['nodename'] = nodename
         if info['handler'] == pxeh:
             return do_pxe_discovery(cfg, handler, info, manual, nodename, policies)
@@ -1133,6 +1402,10 @@ def discover_node(cfg, handler, info, nodename, manual):
                              nodename, str(e))})
                 traceback.print_exc()
                 return False
+            nodeconfig = cfg.get_node_attributes(nodename, 'discovery.nodeconfig')
+            nodeconfig = nodeconfig.get(nodename, {}).get('discovery.nodeconfig', {}).get('value', None)
+            if nodeconfig:
+                nodeconfig = shlex.split(nodeconfig)
             newnodeattribs = {}
             if list(cfm.list_collective()):
                 # We are in a collective, check collective.manager
@@ -1155,6 +1428,19 @@ def discover_node(cfg, handler, info, nodename, manual):
                 cfg.set_node_attributes({nodename: newnodeattribs})
             log.log({'info': 'Discovered {0} ({1})'.format(nodename,
                                                           handler.devname)})
+            if nodeconfig:
+                bmcaddr = cfg.get_node_attributes(nodename, 'hardwaremanagement.manager')
+                bmcaddr = bmcaddr.get(nodename, {}).get('hardwaremanagement.manager', {}).get('value', '')
+                if not bmcaddr:
+                    log.log({'error': 'Unable to get BMC address for {0]'.format(nodename)})
+                else:
+                    bmcaddr = bmcaddr.split('/', 1)[0]
+                    wait_for_connection(bmcaddr)
+                    socket.getaddrinfo(bmcaddr, 443)
+                    subprocess.check_call(['/opt/confluent/bin/nodeconfig', nodename] + nodeconfig)
+                    log.log({'info': 'Configured {0} ({1})'.format(nodename,
+                                                          handler.devname)})
+
         info['discostatus'] = 'discovered'
         for i in pending_by_uuid.get(curruuid, []):
             eventlet.spawn_n(_recheck_single_unknown_info, cfg, i)
@@ -1163,12 +1449,33 @@ def discover_node(cfg, handler, info, nodename, manual):
         except KeyError:
             pass
         return True
-    log.log({'info': 'Detected {0}, but discovery.policy is not set to a '
-                     'value allowing discovery (open or permissive)'.format(
-                        nodename)})
-    info['discofailure'] = 'policy'
+    if info['handler'] == pxeh:
+        olduuid = dp.get(nodename, {}).get('id.uuid', {}).get(
+            'value', '')
+        if olduuid.lower() != info['uuid']:
+            log.log({'info': 'Detected {0}, but discovery.policy is not set to a '
+                            'value allowing discovery (open, permissive, or pxe)'.format(
+                                nodename)})
+            info['discofailure'] = 'policy'
+    else:
+        log.log({'info': 'Detected {0}, but discovery.policy is not set to a '
+                         'value allowing discovery (open or permissive)'.format(
+                            nodename)})
+        info['discofailure'] = 'policy'
     return False
 
+def wait_for_connection(bmcaddr):
+    expiry = 75 + util.monotonic_time()
+    while util.monotonic_time() < expiry:
+        for addrinf in socket.getaddrinfo(bmcaddr, 443, proto=socket.IPPROTO_TCP):
+            try:
+                tsock = socket.socket(addrinf[0])
+                tsock.settimeout(1)
+                tsock.connect(addrinf[4])
+                return
+            except OSError:
+                continue
+        eventlet.sleep(1)
 
 def do_pxe_discovery(cfg, handler, info, manual, nodename, policies):
     # use uuid based scheme in lieu of tls cert, ideally only
@@ -1280,6 +1587,13 @@ def rescan():
         return
     else:
         scanner = eventlet.spawn(blocking_scan)
+    remotescan()
+
+def remotescan():
+    mycfm = cfm.ConfigManager(None)
+    myname = collective.get_myname()
+    for remagent in get_subscriptions():
+        affluent.renotify_me(remagent, mycfm, myname)
 
 
 def blocking_scan():
@@ -1308,7 +1622,7 @@ def start_detection():
     if rechecker is None:
         rechecktime = util.monotonic_time() + 900
         rechecker = eventlet.spawn_after(900, _periodic_recheck, cfg)
-    eventlet.spawn_n(ssdp.snoop, None, None, ssdp, get_node_by_uuid_or_mac)
+    eventlet.spawn_n(ssdp.snoop, safe_detected, None, ssdp, get_node_by_uuid_or_mac)
 
 def stop_autosense():
     for watcher in list(autosensors):
@@ -1317,7 +1631,8 @@ def stop_autosense():
 
 def start_autosense():
     autosensors.add(eventlet.spawn(slp.snoop, safe_detected, slp))
-    autosensors.add(eventlet.spawn(pxe.snoop, safe_detected, pxe))
+    autosensors.add(eventlet.spawn(pxe.snoop, safe_detected, pxe, get_node_guess_by_uuid))
+    remotescan()
 
 
 nodes_by_fprint = {}

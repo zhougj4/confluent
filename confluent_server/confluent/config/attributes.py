@@ -94,7 +94,7 @@ node = {
                         'considered a member'),
     },
     'type': {
-        'description': ('Classification of node as server or switch'),
+        'description': ('Classification of node as server or switch.  By default a node is presumed to be a server.'),
         'validvalues': ('switch', 'server'),
     },
     'crypted.rootpassword': {
@@ -110,6 +110,9 @@ node = {
     'crypted.selfapikey': {
         'description': ('Crypt of api key for self api requests by node'),
     },
+    'trusted.subnets': {
+        'description': 'Remote subnets in CIDR notation that should be considered as trusted as local networks'
+    },
     'deployment.encryptboot': {
         'description': ('Specify a strategy for encrypting the volume. Support '
                         'for this setting is currently only enabled for '
@@ -124,10 +127,13 @@ node = {
     'deployment.apiarmed': {
         'description': ('Indicates whether the node authentication token interface '
                         'is armed.  If set to once, it will grant only the next '
-                        'request. If set to continuous, will allow many requests.'
-                        'Should not be set unless an OS deployment is pending. '
+                        'request. If set to continuous, will allow many requests, '
+                        'which greatly reduces security, particularly when connected to '
+                        'untrusted networks. '
+                        'Should not be set unless an OS deployment is pending on the node. '
                         'Generally this is not directly modified, but is modified '
                         'by the "nodedeploy" command'),
+        'validvalues': ('once', 'continuous', ''),
     },
     'deployment.sealedapikey': {
         'description': 'This attribute is used by some images to save a sealed '
@@ -227,6 +233,12 @@ node = {
                         'a stateless profile would be both after first boot.')
 
     },
+    'deployment.state': {
+        'description': ('Profiles may push more specific state, for example, it may set the state to "failed" or "succeded"'),
+    },
+    'deployment.state_detail': {
+        'description': ('Detailed state information as reported by an OS profile, when available'),
+    },
     'deployment.useinsecureprotocols': {
         'description': ('What phase(s) of boot are permitted to use insecure protocols '
                         '(TFTP and HTTP without TLS.  By default, only HTTPS is used.  However '
@@ -247,6 +259,10 @@ node = {
                         'and any restrictions around reusing an old password.',
         'validlistkeys': ('expiration', 'loginfailures', 'complexity', 'reuse'),
     },
+    'discovery.nodeconfig': {
+        'description':  'Set of nodeconfig arguments to apply after automatic discovery'
+
+    },
     'discovery.policy': {
         'description':  'Policy to use for auto-configuration of discovered '
                         'and identified nodes. Valid values are "manual", '
@@ -256,7 +272,7 @@ node = {
                         'so long as the node has no existing public key. '
                         '"open" allows discovery even if a known public key '
                         'is already stored',
-        'validlist': ('manual', 'permissive', 'pxe', 'open'),
+        'validlist': ('manual', 'permissive', 'pxe', 'open', 'verified'),
     },
     'info.note': {
         'description':  'A field used for administrators to make arbitrary '
@@ -346,14 +362,15 @@ node = {
 #    },
     'console.logging': {
         'description': ('Indicate logging level to apply to console.  Valid '
-                        'values are currently "full", "interactive", and '
+                        'values are currently "full", "interactive", "memory", and '
                         '"none". Defaults to "full".'),
         'validvalues': ('full', 'memory', 'interactive', 'none'),
     },
     'console.method': {
         'description': ('Indicate the method used to access the console of '
                         'the managed node.  If not specified, then console '
-                        'is disabled'),
+                        'is disabled.  "ipmi" should be specified for most '
+                        'systems if console is desired.'),
         'validvalues': ('ssh', 'ipmi', 'tsmsol'),
     },
 #    'virtualization.host': {
@@ -379,7 +396,9 @@ node = {
 #    },
     'hardwaremanagement.manager': {
         'description': 'The management address dedicated to this node.  This '
-                       'is the address of, for example, the Lenovo IMM.',
+                       'is the address of, for example, the Lenovo XCC.  It may optionally '
+                       'include /<prefixlen> CIDR suffix to indicate subnet length, which is '
+                       'autodetected by default where possible.',
     },
     'hardwaremanagement.method': {
         'description': 'The method used to perform operations such as power '
@@ -441,6 +460,19 @@ node = {
         'description': 'Whether or not the indicated network interface is to be used for booting.  This is used by '
                        'the discovery process to decide where to place the mac address of a detected PXE nic.',
     },
+    'net.connection_name': {
+        'description': 'Name to use when specifiying a name for connection and/or interface name for a team.  This may be the name of a team interface, '
+                       'the connection name in network manager for the interface, or may be installed as an altname '
+                       'as supported by the respective OS deployment profiles.  Default is to accept default name for '
+                       'a team consistent with the respective OS, or to use the matching original port name as connection name.'
+    },
+    'net.interface_names': {
+        'description': 'Interface name or comma delimited list of names to match for this interface. It is generally recommended '
+                       'to leave this blank unless needing to set up interfaces that are not on a common subnet with a confluent server, '
+                       'as confluent servers provide autodetection for matching the correct network definition to an interface.'
+                       'This would be the default name per the deployed OS and can be a comma delimited list to denote members of '
+                       'a team'
+    },
     'net.ipv4_address': {
         'description': 'When configuring static, use this address.  If '
                        'unspecified, it will check if the node name resolves '
@@ -453,12 +485,36 @@ node = {
         'description': 'Whether to use static or dhcp when configuring this '
                        'interface for IPv4. "firmwaredhcp" means to defer to '
                        'external DHCP server during firmware execution, but '
-                       'use static for OS',
-        'validvalues': ('dhcp', 'static', 'firmwaredhcp', 'none')
+                       'use static for OS. "firmwarenone" means to suppress '
+                       'even the no-IP dhcp offers, to fully delegate to an external '
+                       'dhcp/pxe configuration, even for confluent deployment.',
+        'validvalues': ('dhcp', 'static', 'firmwaredhcp', 'firmwarenone', 'none')
     },
     'net.ipv4_gateway': {
         'description':  'The IPv4 gateway to use if applicable.  As is the '
                         'case for other net attributes, net.eth0.ipv4_gateway '
+                        'and similar is accepted.'
+    },
+    'net.ipv6_address': {
+        'description': 'When configuring static, use this address.  If '
+                       'unspecified, it will check if the node name resolves '
+                       'to an IP address.  Additionally, the subnet prefix '
+                       'may be specified with a suffix, e.g. "/64".  If not '
+                       'specified, it will attempt to autodetect based on '
+                       'current network configuration.'
+    },
+    'net.ipv6_method': {
+        'description': 'Whether to use static or dhcp when configuring this '
+                       'interface for IPv6. "firmwaredhcp" means to defer to '
+                       'external DHCP server during firmware execution, but '
+                       'use static for OS. "firmwarenone" means to suppress '
+                       'even the no-IP dhcp offers, to fully delegate to an external '
+                       'dhcp/pxe configuration, even for confluent deployment',
+        'validvalues': ('dhcp', 'static', 'firmwaredhcp', 'firmwarenone', 'none')
+    },
+    'net.ipv6_gateway': {
+        'description':  'The IPv6 gateway to use if applicable.  As is the '
+                        'case for other net attributes, net.eth0.ipv6_gateway '
                         'and similar is accepted.'
     },
     'net.hwaddr': {
@@ -493,6 +549,19 @@ node = {
                        'depending on default configuration of the respective '
                        'operating system',
     },
+    'net.team_mode': {
+        'description': 'Indicates that this interface should be a team and what mode or runner to use when teamed. '
+                       'If this covers a deployment interface, one of the member interfaces may be brought up as '
+                       'a standalone interface until deployment is complete, as supported by the OS deployment profile. '
+                       'To support this scenario, the switch should be set up to allow independent operation of member ports123654 (e.g. lacp bypass mode or fallback mode).',
+        'validvalues': ('lacp', 'loadbalance', 'roundrobin', 'activebackup', 'none')
+    },
+    'power.pdu': {
+        'description': 'Specifies the managed PDU associated with a power input on the node'
+    },
+    'power.outlet': {
+        'description': 'Species the outlet identifier on the PDU associoted with a power input on the node'
+    },
 #    'id.modelnumber': {
 #        'description': 'The manufacturer dictated  model number for the node',
 #    },
@@ -508,6 +577,9 @@ node = {
 #    'secret.snmppassword': {
 #        'description': 'The password to use for SNMPv3 access to this node',
 #    },
+    'secret.selfapiarmtoken': {
+        'description': 'A one-time use shared secret to authenticate a node api token',
+    },
     'secret.snmpcommunity': {
         'description': ('SNMPv1 community string, it is highly recommended to'
                         'step up to SNMPv3'),
@@ -536,11 +608,11 @@ node = {
     },
     'secret.hardwaremanagementuser': {
         'description': ('The username to use when connecting to the hardware '
-                        'manager'),
+                        'manager. Aliases for this attribute include bmcuser and switchuser'),
     },
     'secret.hardwaremanagementpassword': {
         'description': ('Password to use when connecting to the hardware '
-                        'manager'),
+                        'manager.  Aliases for this attribute include bmcpass and switchpass'),
     },
     'ssh.trustnodes': {
         'description': ('Nodes that are allowed to ssh into the node, '

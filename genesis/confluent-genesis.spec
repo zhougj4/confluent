@@ -1,6 +1,6 @@
 %define arch x86_64
-Version: 3.3.0
-Release:  2
+Version: 3.6.2
+Release:  1
 Name: confluent-genesis-%{arch}
 BuildArch: noarch
 Summary: Genesis servicing image for confluent
@@ -28,6 +28,7 @@ find . -type f -exec chmod o+r {} +
 find . -type f -exec chmod -x {} +
 
 %files
+/opt/confluent/genesis/%{arch}/rpmlist
 /opt/confluent/genesis/%{arch}/boot/efi/boot/BOOTX64.EFI
 /opt/confluent/genesis/%{arch}/boot/efi/boot/grubx64.efi
 /opt/confluent/genesis/%{arch}/boot/initramfs/distribution

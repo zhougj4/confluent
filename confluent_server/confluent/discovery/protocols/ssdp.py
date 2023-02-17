@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2017 Lenovo
+# Copyright 2017-2022 Lenovo
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,17 +35,16 @@ import confluent.noderange as noderange
 import confluent.util as util
 import confluent.log as log
 import confluent.netutil as netutil
+import eventlet
 import eventlet.green.select as select
 import eventlet.green.socket as socket
 import eventlet.greenpool as gp
+import os
 import time
-try:
-    from eventlet.green.urllib.request import urlopen
-except (ImportError, AssertionError):
-    from eventlet.green.urllib2 import urlopen
 import struct
 import traceback
 
+webclient = eventlet.import_patched('pyghmi.util.webclient')
 mcastv4addr = '239.255.255.250'
 mcastv6addr = 'ff02::c'
 
@@ -59,15 +58,15 @@ smsg = ('M-SEARCH * HTTP/1.1\r\n'
 
 def active_scan(handler, protocol=None):
     known_peers = set([])
-    for scanned in scan(['urn:dmtf-org:service:redfish-rest:1']):
+    for scanned in scan(['urn:dmtf-org:service:redfish-rest:1', 'urn::service:affluent']):
         for addr in scanned['addresses']:
-            ip = addr[0].partition('%')[0]  # discard scope if present
-            if ip not in neighutil.neightable:
-                neighutil.update_neigh()
-            if ip not in neighutil.neightable:
-                continue
             if addr in known_peers:
                 break
+            hwaddr = neighutil.get_hwaddr(addr[0])
+            if not hwaddr:
+                continue
+            if not scanned.get('hwaddr', None):
+                scanned['hwaddr'] = hwaddr
             known_peers.add(addr)
         else:
             scanned['protocol'] = protocol
@@ -77,6 +76,47 @@ def scan(services, target=None):
     for service in services:
         for rply in _find_service(service, target):
             yield rply
+
+
+def _process_snoop(peer, rsp, mac, known_peers, newmacs, peerbymacaddress, byehandler, machandlers, handler):
+    if mac in peerbymacaddress and peer not in peerbymacaddress[mac]['addresses']:
+        peerbymacaddress[mac]['addresses'].append(peer)
+    else:
+        peerdata = {
+            'hwaddr': mac,
+            'addresses': [peer],
+        }
+        for headline in rsp[1:]:
+            if not headline:
+                continue
+            headline = util.stringify(headline)
+            header, _, value = headline.partition(':')
+            header = header.strip()
+            value = value.strip()
+            if header == 'NT':
+                if 'redfish-rest' not in value:
+                    return
+            elif header == 'NTS':
+                if value == 'ssdp:byebye':
+                    handler = byehandler
+                elif value != 'ssdp:alive':
+                    handler = None
+            elif header == 'AL':
+                if not value.endswith('/redfish/v1/'):
+                    return
+            elif header == 'LOCATION':
+                if not value.endswith('/DeviceDescription.json'):
+                    return
+        if handler:
+            eventlet.spawn_n(check_fish_handler, handler, peerdata, known_peers, newmacs, peerbymacaddress, machandlers, mac, peer)
+
+def check_fish_handler(handler, peerdata, known_peers, newmacs, peerbymacaddress, machandlers, mac, peer):
+    retdata = check_fish(('/DeviceDescription.json', peerdata))
+    if retdata:
+        known_peers.add(peer)
+        newmacs.add(mac)
+        peerbymacaddress[mac] = retdata
+        machandlers[mac] = handler
 
 
 def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
@@ -96,7 +136,13 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
     # dabbling in multicast wizardry here, such sockets can cause big problems,
     # so we will have two distinct sockets
     tracelog = log.Logger('trace')
+    try:
+        active_scan(handler, protocol)
+    except Exception as e:
+        tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
+                    event=log.Events.stacktrace)
     known_peers = set([])
+    recent_peers = set([])
     net6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     net6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     for ifidx in util.list_interface_indexes():
@@ -121,48 +167,41 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
     while True:
         try:
             newmacs = set([])
+            deferrednotifies = []
             machandlers = {}
-            r, _, _ = select.select((net4, net6), (), (), 60)
-            while r:
+            r = select.select((net4, net6), (), (), 60)
+            if r:
+                r = r[0]
+            recent_peers = set([])
+            while r and len(deferrednotifies) < 256:
                 for s in r:
                     (rsp, peer) = s.recvfrom(9000)
                     if rsp[:4] == b'PING':
                         continue
+                    if peer in recent_peers:
+                        continue
                     rsp = rsp.split(b'\r\n')
-                    method, _, _ = rsp[0].split(b' ', 2)
+                    if b' ' not in rsp[0]:
+                        continue
+                    method, _ = rsp[0].split(b' ', 1)
                     if method == b'NOTIFY':
-                        ip = peer[0].partition('%')[0]
                         if peer in known_peers:
                             continue
-                        if ip not in neighutil.neightable:
-                            neighutil.update_neigh()
-                        if ip not in neighutil.neightable:
+                        recent_peers.add(peer)
+                        mac = neighutil.get_hwaddr(peer[0])
+                        if mac == False:
+                            # neighutil determined peer ip is not local, skip attempt
+                            # to probe and critically, skip growing deferrednotifiers
                             continue
-                        mac = neighutil.neightable[ip]
-                        known_peers.add(peer)
-                        newmacs.add(mac)
-                        if mac in peerbymacaddress:
-                            peerbymacaddress[mac]['addresses'].append(peer)
-                        else:
-                            peerbymacaddress[mac] = {
-                                'hwaddr': mac,
-                                'addresses': [peer],
-                            }
-                            peerdata = peerbymacaddress[mac]
-                            for headline in rsp[1:]:
-                                if not headline:
-                                    continue
-                                headline = util.stringify(headline)
-                                header, _, value = headline.partition(':')
-                                header = header.strip()
-                                value = value.strip()
-                                if header == 'NT':
-                                    peerdata['service'] = value
-                                elif header == 'NTS':
-                                    if value == 'ssdp:byebye':
-                                        machandlers[mac] = byehandler
-                                    elif value == 'ssdp:alive':
-                                        machandlers[mac] = None # handler
+                        if not mac:
+                            probepeer = (peer[0], struct.unpack('H', os.urandom(2))[0] | 1025) + peer[2:]
+                            try:
+                                s.sendto(b'\x00', probepeer)
+                            except Exception:
+                                continue
+                            deferrednotifies.append((peer, rsp))
+                            continue
+                        _process_snoop(peer, rsp, mac, known_peers, newmacs, peerbymacaddress, byehandler, machandlers, handler)
                     elif method == b'M-SEARCH':
                         if not uuidlookup:
                             continue
@@ -174,6 +213,7 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                             headline = headline.partition(':')
                             if len(headline) < 3:
                                 continue
+                            forcereply = False
                             if  headline[0] == 'ST' and headline[-1].startswith(' urn:xcat.org:service:confluent:'):
                                 try:
                                     cfm.check_quorum()
@@ -181,22 +221,34 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                                     continue
                                 for query in headline[-1].split('/'):
                                     node = None
-                                    if query.startswith('uuid='):
+                                    if query.startswith('confluentuuid='):
+                                        myuuid = cfm.get_global('confluent_uuid')
+                                        curruuid = query.split('=', 1)[1].lower()
+                                        if curruuid != myuuid:
+                                            break
+                                        forcereply = True
+                                    elif query.startswith('allconfluent=1'):
+                                        reply = 'HTTP/1.1 200 OK\r\n\r\nCONFLUENT: PRESENT\r\n'
+                                        if not isinstance(reply, bytes):
+                                            reply = reply.encode('utf8')
+                                        s.sendto(reply, peer)
+                                    elif query.startswith('uuid='):
                                         curruuid = query.split('=', 1)[1].lower()
                                         node = uuidlookup(curruuid)
                                     elif query.startswith('mac='):
                                         currmac = query.split('=', 1)[1].lower()
                                         node = uuidlookup(currmac)
                                     if node:
-                                        # Do not bother replying to a node that
-                                        # we have no deployment activity
-                                        # planned for
                                         cfg = cfm.ConfigManager(None)
                                         cfd = cfg.get_node_attributes(
                                             node, ['deployment.pendingprofile', 'collective.managercandidates'])
-                                        if not cfd.get(node, {}).get(
-                                                'deployment.pendingprofile', {}).get('value', None):
-                                            break
+                                        if not forcereply:
+                                            # Do not bother replying to a node that
+                                            # we have no deployment activity
+                                            # planned for
+                                            if not cfd.get(node, {}).get(
+                                                    'deployment.pendingprofile', {}).get('value', None):
+                                                break
                                         candmgrs = cfd.get(node, {}).get('collective.managercandidates', {}).get('value', None)
                                         if candmgrs:
                                             candmgrs = noderange.NodeRange(candmgrs, cfg).nodes
@@ -207,7 +259,7 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                                         msecs = int(currtime * 1000 % 1000)
                                         reply = 'HTTP/1.1 200 OK\r\nNODENAME: {0}\r\nCURRTIME: {1}\r\nCURRMSECS: {2}\r\n'.format(node, seconds, msecs)
                                         if '%' in peer[0]:
-                                            iface = peer[0].split('%', 1)[1]
+                                            iface = socket.getaddrinfo(peer[0], 0, socket.AF_INET6, socket.SOCK_DGRAM)[0][-1][-1]
                                             reply += 'MGTIFACE: {0}\r\n'.format(
                                                 peer[0].split('%', 1)[1])
                                             ncfg = netutil.get_nic_config(
@@ -219,7 +271,18 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                                         if not isinstance(reply, bytes):
                                             reply = reply.encode('utf8')
                                         s.sendto(reply, peer)
-                r, _, _ = select.select((net4, net6), (), (), 0.2)
+                                        break
+                r = select.select((net4, net6), (), (), 0.2)
+                if r:
+                    r = r[0]
+            if deferrednotifies:
+                eventlet.sleep(2.2)
+            for peerrsp in deferrednotifies:
+                peer, rsp = peerrsp
+                mac = neighutil.get_hwaddr(peer[0])
+                if not mac:
+                    continue
+                _process_snoop(peer, rsp, mac, known_peers, newmacs, peerbymacaddress, byehandler, machandlers, handler)
             for mac in newmacs:
                 thehandler = machandlers.get(mac, None)
                 if thehandler:
@@ -228,6 +291,14 @@ def snoop(handler, byehandler=None, protocol=None, uuidlookup=None):
                 tracelog.log(traceback.format_exc(), ltype=log.DataTypes.event,
                              event=log.Events.stacktrace)
 
+
+def _get_svrip(peerdata):
+    for addr in peerdata['addresses']:
+        if addr[0].startswith('fe80::'):
+            if '%' not in addr[0]:
+                return addr[0] + '%{0}'.format(addr[3])
+            return addr[0]
+    return peerdata['addresses'][0][0]
 
 def _find_service(service, target):
     net4 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -271,7 +342,11 @@ def _find_service(service, target):
             msg = smsg.format(mcastv4addr, service)
             if not isinstance(msg, bytes):
                 msg = msg.encode('utf8')
-            net4.sendto(msg, (mcastv4addr, 1900))
+            try:
+                net4.sendto(msg, (mcastv4addr, 1900))
+            except socket.error as se:
+                if se.errno != 101:
+                    raise
             msg = smsg.format(bcast, service)
             if not isinstance(msg, bytes):
                 msg = msg.encode('utf8')
@@ -281,46 +356,100 @@ def _find_service(service, target):
     deadline = util.monotonic_time() + 4
     r, _, _ = select.select((net4, net6), (), (), 4)
     peerdata = {}
+    deferparse = []
     while r:
         for s in r:
             (rsp, peer) = s.recvfrom(9000)
-            neighutil.refresh_neigh()
+            if not neighutil.get_hwaddr(peer[0]):
+                probepeer = (peer[0], struct.unpack('H', os.urandom(2))[0] | 1025) + peer[2:]
+                try:
+                    s.sendto(b'\x00', probepeer)
+                except Exception:
+                    continue
+                deferparse.append((rsp, peer))
+                continue
             _parse_ssdp(peer, rsp, peerdata)
         timeout = deadline - util.monotonic_time()
         if timeout < 0:
             timeout = 0
         r, _, _ = select.select((net4, net6), (), (), timeout)
+    if deferparse:
+        eventlet.sleep(2.2)
+    for dp in deferparse:
+        rsp, peer = dp
+        _parse_ssdp(peer, rsp, peerdata)
     querypool = gp.GreenPool()
     pooltargs = []
     for nid in peerdata:
-        for url in peerdata[nid].get('urls', ()):
-            if url.endswith('/desc.tmpl'):
-                pooltargs.append((url, peerdata[nid]))
-    for pi in querypool.imap(check_cpstorage, pooltargs):
+        if peerdata[nid].get('services', [None])[0] == 'urn::service:affluent:1':
+            peerdata[nid]['attributes'] = {
+                'type': 'affluent-switch',
+            }
+            peerdata[nid]['services'] = ['affluent-switch']
+            mya = peerdata[nid]['attributes']
+            usn = peerdata[nid]['usn']
+            idinfo = usn.split('::')
+            for idi in idinfo:
+                key, val = idi.split(':', 1)
+                if key == 'uuid':
+                    peerdata[nid]['uuid'] = val
+                elif key == 'serial':
+                    mya['enclosure-serial-number'] = [val]
+                elif key == 'model':
+                    mya['enclosure-machinetype-model'] = [val]
+            yield peerdata[nid]
+            continue
+        if '/redfish/v1/' not in peerdata[nid].get('urls', ()) and '/redfish/v1' not in peerdata[nid].get('urls', ()):
+            continue
+        if '/DeviceDescription.json' in peerdata[nid]['urls']:
+            pooltargs.append(('/DeviceDescription.json', peerdata[nid]))
+        # For now, don't interrogate generic redfish bmcs
+        # This is due to a need to deduplicate from some supported SLP
+        # targets (IMM, TSM, others)
+        # activate this else once the core filters/merges duplicate uuid
+        # or we drop support for those devices
+        #else:
+        #    pooltargs.append(('/redfish/v1/', peerdata[nid]))
+    for pi in querypool.imap(check_fish, pooltargs):
         if pi is not None:
             yield pi
 
-def check_cpstorage(urldata):
+def check_fish(urldata, port=443, verifycallback=None):
+    if not verifycallback:
+        verifycallback = lambda x: True
     url, data = urldata
     try:
-        info = urlopen(url, timeout=1).read()
-        if b'<friendlyName>Athena</friendlyName>' in info:
-            data['services'] = ['service:thinkagile-storage']
+        wc = webclient.SecureHTTPConnection(_get_svrip(data), port, verifycallback=verifycallback, timeout=1.5)
+        peerinfo = wc.grab_json_response(url)
+    except socket.error:
+        return None
+    if url == '/DeviceDescription.json':
+        try:
+            peerinfo = peerinfo[0]
+            myuuid = peerinfo['node-uuid'].lower()
+            if '-' not in myuuid:
+                myuuid = '-'.join([myuuid[:8], myuuid[8:12], myuuid[12:16], myuuid[16:20], myuuid[20:]])
+            data['uuid'] = myuuid
+            data['attributes'] = peerinfo
+            data['services'] = ['lenovo-xcc']
             return data
-    except Exception:
-        pass
+        except (IndexError, KeyError):
+            return None
+            url = '/redfish/v1/'
+            peerinfo = wc.grab_json_response('/redfish/v1/')
+    if url == '/redfish/v1/':
+        if 'UUID' in peerinfo:
+            data['services'] = ['service:redfish-bmc']
+            data['uuid'] = peerinfo['UUID'].lower()
+            return data
     return None
 
-
 def _parse_ssdp(peer, rsp, peerdata):
-    ip = peer[0].partition('%')[0]
-    nid = ip
+    nid = peer[0]
     mac = None
-    if ip not in neighutil.neightable:
-        neighutil.update_neigh()
-    if ip in neighutil.neightable:
-        nid = neighutil.neightable[ip]
-        mac = nid
+    mac = neighutil.get_hwaddr(peer[0])
+    if mac:
+        nid = mac
     headlines = rsp.split(b'\r\n')
     try:
         _, code, _ = headlines[0].split(b' ', 2)
@@ -341,9 +470,11 @@ def _parse_ssdp(peer, rsp, peerdata):
             if not headline:
                 continue
             header, _, value = headline.partition(b':')
-            header = header.strip()
-            value = value.strip()
+            header = header.strip().decode('utf8')
+            value = value.strip().decode('utf8')
             if header == 'AL' or header == 'LOCATION':
+                value = value[value.index('://')+3:]
+                value = value[value.index('/'):]
                 if 'urls' not in peerdatum:
                     peerdatum['urls'] = [value]
                 elif value not in peerdatum['urls']:
@@ -353,11 +484,14 @@ def _parse_ssdp(peer, rsp, peerdata):
                     peerdatum['services'] = [value]
                 elif value not in peerdatum['services']:
                     peerdatum['services'].append(value)
+            elif header == 'USN':
+                peerdatum['usn'] = value
+            elif header == 'MODELNAME':
+                peerdatum['modelname'] = value
 
 
 
 if __name__ == '__main__':
-
-    for rsp in scan(['urn:dmtf-org:service:redfish-rest:1'], '10.240.52.189'):
+    def printit(rsp):
         print(repr(rsp))
-    
+    active_scan(printit)
